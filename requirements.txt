@@ -1,0 +1,13 @@
+# 达梦数据库表结构差异对比工具 - 依赖列表
+
+# 达梦数据库官方驱动
+# 安装方式: pip install dmPython
+# 或从达梦安装目录获取: dmdbms/drivers/python/dmPython
+dmPython>=2.3.0
+
+# Excel文件生成
+openpyxl>=3.1.0
+
+# Web页面
+streamlit>=1.35.0
+pandas>=2.0.0
