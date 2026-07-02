@@ -649,7 +649,7 @@ def render_result(config_path: str):
     with tabs[3]:
         render_dataframe('索引差异', build_index_diff_rows(result), config_path=config_path)
     with tabs[4]:
-        render_dataframe('主键差异', build_primary_key_diff_rows(result))
+        render_dataframe('主键差异', build_primary_key_diff_rows(result), config_path=config_path)
     with tabs[5]:
         render_schema_diff(build_schema_diff_rows(result))
 

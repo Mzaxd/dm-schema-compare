@@ -91,6 +91,9 @@ class ColumnInfo:
     default: Optional[str]
     comment: Optional[str] = ""
     is_primary_key: bool = False
+    is_identity: bool = False
+    identity_start: Optional[int] = None
+    identity_increment: Optional[int] = None
 
     def __hash__(self):
         return hash(self.name)
@@ -343,11 +346,15 @@ class DMMetadataExtractor:
             )
         return tables
 
-    def get_table_columns(self, schema: str, table_name: str) -> Dict[str, ColumnInfo]:
-        """获取表的所有字段信息"""
-        # 使用 ALL_TAB_COLUMNS 代替 DBA_TAB_COLUMNS，不需要DBA权限
+    def get_schema_columns(self, schema: str) -> Dict[str, Dict[str, ColumnInfo]]:
+        """一次查询获取模式下所有表的所有字段，按表名分组。
+
+        批量替代逐表查询，消除 N+1 网络往返；与 get_schema_indexes 等 schema 级
+        查询保持一致的批量风格。dict 保持插入顺序，列按 COLUMN_ID 排序。
+        """
         sql = """
             SELECT
+                T.TABLE_NAME,
                 T.COLUMN_NAME,
                 T.DATA_TYPE,
                 T.DATA_LENGTH,
@@ -360,14 +367,14 @@ class DMMetadataExtractor:
             LEFT JOIN ALL_COL_COMMENTS C
                 ON T.COLUMN_NAME = C.COLUMN_NAME AND T.OWNER = C.OWNER
                 AND T.TABLE_NAME = C.TABLE_NAME
-            WHERE T.OWNER = ? AND T.TABLE_NAME = ?
-            ORDER BY T.COLUMN_ID
+            WHERE T.OWNER = ?
+            ORDER BY T.TABLE_NAME, T.COLUMN_ID
         """
-        result = self.conn.execute_query(sql, (schema, table_name))
-        columns = {}
+        result = self.conn.execute_query(sql, (schema,))
+        table_columns: Dict[str, Dict[str, ColumnInfo]] = {}
         for row in result:
-            col_name, data_type, length, precision, scale, nullable, default, comment = row
-            columns[col_name] = ColumnInfo(
+            table_name, col_name, data_type, length, precision, scale, nullable, default, comment = row
+            table_columns.setdefault(table_name, {})[col_name] = ColumnInfo(
                 name=col_name,
                 data_type=data_type,
                 length=length,
@@ -377,7 +384,7 @@ class DMMetadataExtractor:
                 default=str(default) if default else None,
                 comment=comment or ""
             )
-        return columns
+        return table_columns
 
     def get_schema_indexes(self, schema: str) -> Dict[str, Dict[str, IndexInfo]]:
         """获取指定模式下所有表的索引信息"""
@@ -480,6 +487,74 @@ class DMMetadataExtractor:
             if column:
                 column.is_primary_key = True
 
+    def get_schema_identity_flags(self, schema: str) -> Dict[str, Set[str]]:
+        """识别模式下所有 IDENTITY 自增列。
+
+        达梦 SYSCOLUMNS.INFO2=1 标识物理表的 IDENTITY 列；INFO1 不存此信息。
+        INFO2 语义随对象类型变化（系统视图列可能为其他值），仅物理表视为 IDENTITY。
+        """
+        sql = """
+            SELECT O.NAME AS TABLE_NAME, C.NAME AS COLUMN_NAME
+            FROM SYS.SYSCOLUMNS C
+            JOIN SYS.SYSOBJECTS O ON C.ID = O.ID
+            JOIN SYS.SYSOBJECTS S ON O.SCHID = S.ID
+            WHERE C.INFO2 = 1 AND S.NAME = ?
+        """
+        result = self.conn.execute_query(sql, (schema,))
+        flags: Dict[str, Set[str]] = {}
+        for table_name, column_name in result:
+            if table_name and column_name:
+                # 表名/列名统一大写，规避 ALL_TABLES 与 SYSCOLUMNS 间的大小写差异
+                flags.setdefault(table_name.upper(), set()).add(column_name.upper())
+        return flags
+
+    def get_table_identity_params(self, schema: str, table_name: str) -> Dict[str, Tuple[int, int]]:
+        """解析建表 DDL，提取每个 IDENTITY 列的 (start, increment)。
+
+        SYSCOLUMNS 不存 start/increment，达梦也无 DBA_TAB_IDENTITY_COLS 视图，
+        唯一精确来源是 DBMS_METADATA.GET_DDL。调用方应保证只在含 IDENTITY 列的表上调用。
+        """
+        sql = "SELECT DBMS_METADATA.GET_DDL('TABLE', ?, ?) FROM DUAL"
+        result = self.conn.execute_query(sql, (table_name, schema))
+        if not result:
+            return {}
+
+        ddl = result[0][0]
+        if hasattr(ddl, 'read'):
+            ddl = ddl.read()
+        ddl_text = str(ddl) or ''
+
+        params: Dict[str, Tuple[int, int]] = {}
+        pattern = re.compile(
+            r'"(?P<col>[^"]+)"\s+\w+(?:\s*\([^)]*\))?\s+IDENTITY\s*\(\s*(?P<start>-?\d+)\s*,\s*(?P<incr>-?\d+)\s*\)',
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(ddl_text):
+            params[match.group('col').upper()] = (int(match.group('start')), int(match.group('incr')))
+        return params
+
+    def _mark_identity_columns(self, schema: str, table_name: str,
+                               columns: Dict[str, ColumnInfo],
+                               identity_flags: Dict[str, Set[str]]):
+        """标记 IDENTITY 列并填充 (start, increment)。同表只调一次 GET_DDL。"""
+        identity_cols = identity_flags.get(table_name.upper())
+        if not identity_cols or not columns:
+            return
+
+        column_map = {name.upper(): column for name, column in columns.items()}
+        for col_name in identity_cols:
+            column = column_map.get(col_name.upper())
+            if column:
+                column.is_identity = True
+
+        params = self.get_table_identity_params(schema, table_name)
+        for col_name in identity_cols:
+            column = column_map.get(col_name.upper())
+            if column and column.is_identity:
+                start, incr = params.get(col_name.upper(), (1, 1))
+                column.identity_start = start
+                column.identity_increment = incr
+
     def extract_all_metadata(self, exclude_schemas: Set[str] = None) -> Dict[str, SchemaInfo]:
         """提取所有元数据"""
         if exclude_schemas is None:
@@ -499,14 +574,17 @@ class DMMetadataExtractor:
             schema_info.tables = self.get_all_tables(schema)
             schema_indexes = self.get_schema_indexes(schema)
             schema_pk_columns = self.get_schema_primary_key_columns(schema)
+            identity_flags = self.get_schema_identity_flags(schema)
 
-            # 提取每个表的字段信息
+            # 一次性批量提取字段，再按表分发，消除逐表 N+1 查询
+            schema_columns = self.get_schema_columns(schema)
             for j, (table_name, table_info) in enumerate(schema_info.tables.items(), 1):
                 logger.debug("    [%d/%d] 表 %s", j, len(schema_info.tables), table_name)
-                table_info.columns = self.get_table_columns(schema, table_name)
+                table_info.columns = schema_columns.get(table_name, {})
                 table_info.indexes = schema_indexes.get(table_name, {})
                 table_info.primary_key_columns = schema_pk_columns.get(table_name, set())
                 self._mark_primary_key_columns(table_info.columns, table_info.primary_key_columns)
+                self._mark_identity_columns(schema, table_name, table_info.columns, identity_flags)
 
             metadata[schema] = schema_info
 
@@ -519,14 +597,17 @@ class DMMetadataExtractor:
         schema_info.tables = self.get_all_tables(schema_name)
         schema_indexes = self.get_schema_indexes(schema_name)
         schema_pk_columns = self.get_schema_primary_key_columns(schema_name)
+        identity_flags = self.get_schema_identity_flags(schema_name)
 
-        # 提取每个表的字段信息
+        # 一次性批量提取字段，再按表分发，消除逐表 N+1 查询
+        schema_columns = self.get_schema_columns(schema_name)
         for j, (table_name, table_info) in enumerate(schema_info.tables.items(), 1):
             logger.debug("    [%d/%d] 表 %s", j, len(schema_info.tables), table_name)
-            table_info.columns = self.get_table_columns(schema_name, table_name)
+            table_info.columns = schema_columns.get(table_name, {})
             table_info.indexes = schema_indexes.get(table_name, {})
             table_info.primary_key_columns = schema_pk_columns.get(table_name, set())
             self._mark_primary_key_columns(table_info.columns, table_info.primary_key_columns)
+            self._mark_identity_columns(schema_name, table_name, table_info.columns, identity_flags)
 
         return schema_info
 
@@ -1019,8 +1100,12 @@ class SchemaComparator:
                 test_pk = test_tables[test_table_name].primary_key_columns
                 prod_pk = prod_tables[prod_table_name].primary_key_columns
 
-                test_pk_str = ', '.join(sorted(test_pk)) if test_pk else ''
-                prod_pk_str = ', '.join(sorted(prod_pk)) if prod_pk else ''
+                # 达梦无引号标识符默认按大写存储，主键列名按大写归一化对比与展示，
+                # 避免 id 与 ID 被误判为差异；生成的 SQL 也会用大写，不会被加引号
+                test_pk_norm = sorted(self._normalize_name(c) for c in test_pk)
+                prod_pk_norm = sorted(self._normalize_name(c) for c in prod_pk)
+                test_pk_str = ', '.join(test_pk_norm)
+                prod_pk_str = ', '.join(prod_pk_norm)
 
                 if not test_pk and not prod_pk:
                     continue
@@ -1041,7 +1126,7 @@ class SchemaComparator:
                         test_value='-',
                         prod_value=prod_pk_str,
                     ))
-                elif sorted(test_pk) != sorted(prod_pk):
+                elif test_pk_norm != prod_pk_norm:
                     diffs.append(PrimaryKeyDiff(
                         schema=schema,
                         table=prod_table_name,
@@ -1431,10 +1516,14 @@ class ReportGenerator:
         column_lines = []
         for column in table.columns.values():
             column_sql = f"    {self._quote_identifier(column.name)} {self._get_column_type_sql(column)}"
-            default_sql = self._format_default_sql(column.default)
-            if default_sql:
-                column_sql += f" DEFAULT {default_sql}"
-            if column.nullable == 'N':
+            if column.is_identity:
+                # IDENTITY 列不接受 DEFAULT，且隐含 NOT NULL
+                column_sql += f" IDENTITY({self._identity_args(column)})"
+            else:
+                default_sql = self._format_default_sql(column.default)
+                if default_sql:
+                    column_sql += f" DEFAULT {default_sql}"
+            if column.nullable == 'N' or column.is_identity:
                 column_sql += " NOT NULL"
             column_lines.append(column_sql)
 
@@ -1467,6 +1556,13 @@ class ReportGenerator:
             column.scale,
             normalize_aliases=True
         )
+
+    @staticmethod
+    def _identity_args(column: ColumnInfo) -> str:
+        """生成 IDENTITY(start, increment) 的参数串，缺省回落 (1, 1)。"""
+        start = column.identity_start if column.identity_start is not None else 1
+        incr = column.identity_increment if column.identity_increment is not None else 1
+        return f"{start}, {incr}"
 
     def _normalize_type_string(self, type_string: str) -> str:
         """将展示用类型字符串转换为达梦DDL可执行类型。"""
@@ -1548,6 +1644,8 @@ class ReportGenerator:
         elif diff_type == '目标端缺失':
             # 目标端缺失该字段，需要添加
             col_type = self._get_column_sync_type_sql(test_column, test_value)
+            if test_column and test_column.is_identity:
+                col_type += f" IDENTITY({self._identity_args(test_column)}) NOT NULL"
             sql = f"ALTER TABLE {table_name} ADD {column_name} {col_type};"
 
         elif diff_type == '源端缺失':
@@ -1781,13 +1879,46 @@ class ReportGenerator:
         ws.column_dimensions['G'].width = 45
         ws.column_dimensions['H'].width = 120
 
+    def _generate_pk_sync_sql(self, diff: PrimaryKeyDiff) -> Optional[str]:
+        """生成主键同步 SQL，以源端主键为目标。"""
+        table_name = self._qualified_name(diff.schema, diff.table)
+        if diff.diff_type == '目标端缺失':
+            cols = self._format_pk_columns(diff.test_value)
+            return f"ALTER TABLE {table_name} ADD PRIMARY KEY ({cols});"
+        if diff.diff_type == '主键列变更':
+            cols = self._format_pk_columns(diff.test_value)
+            return (
+                f"ALTER TABLE {table_name} DROP PRIMARY KEY;\n"
+                f"ALTER TABLE {table_name} ADD PRIMARY KEY ({cols});"
+            )
+        # 源端缺失：目标端独有主键，默认不生成 DROP，需人工确认
+        return None
+
+    @staticmethod
+    def _format_pk_columns(pk_value: str) -> str:
+        """从主键差异值（逗号分隔列名）还原引号包裹的列定义。
+
+        注：primary_key_columns 源自 Set，顺序为字母序；PK 语义与列顺序无关。
+        """
+        cols = [c.strip() for c in (pk_value or '').split(',') if c.strip()]
+        return ', '.join(ReportGenerator._quote_identifier(c) for c in cols)
+
+    def _get_pk_sync_advice(self, diff: PrimaryKeyDiff) -> str:
+        if diff.diff_type == '目标端缺失':
+            return '目标端缺失主键，可按源端添加'
+        if diff.diff_type == '主键列变更':
+            return '主键列不一致，确认后按源端重建（DROP+ADD）'
+        if diff.diff_type == '源端缺失':
+            return '目标端独有主键，需人工确认；默认不生成DROP SQL'
+        return ''
+
     def _create_primary_key_diff_sheet(self, wb: Workbook, style: dict):
         """创建主键差异sheet"""
         ws = wb.create_sheet('主键差异')
 
         sl = self.result.source_label
         tl = self.result.target_label
-        headers = ['模式名', '表名', '差异类型', f'{sl}主键', f'{tl}主键']
+        headers = ['模式名', '表名', '差异类型', f'{sl}主键', f'{tl}主键', '同步建议', '同步SQL']
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=1, column=col, value=header)
             cell.font = style['title_font']
@@ -1808,12 +1939,18 @@ class ReportGenerator:
                 cell.fill = PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid')
             ws.cell(row=row, column=4, value=diff.test_value).border = style['thin_border']
             ws.cell(row=row, column=5, value=diff.prod_value).border = style['thin_border']
+            ws.cell(row=row, column=6, value=self._get_pk_sync_advice(diff)).border = style['thin_border']
+            sql_cell = ws.cell(row=row, column=7, value=self._generate_pk_sync_sql(diff) or '')
+            sql_cell.border = style['thin_border']
+            sql_cell.alignment = Alignment(wrap_text=True, vertical='top')
 
         ws.column_dimensions['A'].width = 20
         ws.column_dimensions['B'].width = 35
         ws.column_dimensions['C'].width = 15
         ws.column_dimensions['D'].width = 45
         ws.column_dimensions['E'].width = 45
+        ws.column_dimensions['F'].width = 45
+        ws.column_dimensions['G'].width = 120
 
 
 def load_config(config_path: str) -> configparser.ConfigParser:
@@ -2234,6 +2371,7 @@ def build_index_diff_rows(result: ComparisonResult) -> List[Dict[str, Any]]:
 def build_primary_key_diff_rows(result: ComparisonResult) -> List[Dict[str, Any]]:
     sl = result.source_label
     tl = result.target_label
+    generator = ReportGenerator(result)
     return [
         {
             '模式名': diff.schema,
@@ -2241,6 +2379,8 @@ def build_primary_key_diff_rows(result: ComparisonResult) -> List[Dict[str, Any]
             '差异类型': diff.diff_type,
             f'{sl}主键': diff.test_value,
             f'{tl}主键': diff.prod_value,
+            '同步建议': generator._get_pk_sync_advice(diff),
+            '同步SQL': generator._generate_pk_sync_sql(diff) or '',
         }
         for diff in result.primary_key_diffs
     ]
