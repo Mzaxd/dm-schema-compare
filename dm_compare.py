@@ -177,6 +177,39 @@ class IndexInfo:
 
 
 @dataclasses.dataclass
+class SequenceInfo:
+    """序列信息。schema 级对象，不挂在某张表下。"""
+    name: str
+    schema: str
+    min_value: Optional[int]
+    max_value: Optional[int]
+    increment_by: Optional[int]
+    cycle_flag: Optional[str]   # 'Y' / 'N'
+    order_flag: Optional[str]   # 'Y' / 'N'
+    cache_size: Optional[int]   # 0 表示 NOCACHE
+
+    def __hash__(self):
+        return hash((self.schema, self.name))
+
+    def __eq__(self, other):
+        if not isinstance(other, SequenceInfo):
+            return False
+        return self.schema == other.schema and self.name == other.name
+
+    def get_attribute_string(self) -> str:
+        """紧凑属性串，用于对比展示。"""
+        cache = 'NOCACHE' if (self.cache_size or 0) == 0 else f'CACHE {self.cache_size}'
+        return (
+            f"INCREMENT_BY={self.increment_by}, "
+            f"MIN_VALUE={self.min_value}, "
+            f"MAX_VALUE={self.max_value}, "
+            f"CYCLE={self.cycle_flag}, "
+            f"{cache}, "
+            f"ORDER={self.order_flag}"
+        )
+
+
+@dataclasses.dataclass
 class SchemaConnectionConfig:
     """单个模式的数据库连接配置"""
     schema: str
@@ -211,6 +244,7 @@ class SchemaInfo:
     """模式信息"""
     name: str
     tables: Dict[str, TableInfo] = dataclasses.field(default_factory=dict)
+    sequences: Dict[str, SequenceInfo] = dataclasses.field(default_factory=dict)
 
 
 class DMConnection:
@@ -475,6 +509,37 @@ class DMMetadataExtractor:
 
         return table_columns
 
+    def get_schema_sequences(self, schema: str) -> Dict[str, SequenceInfo]:
+        """一次查询获取模式下所有序列，按序列名分组。
+
+        ALL_SEQUENCES 已含全部建序列所需属性，无需再调 DBMS_METADATA.GET_DDL，
+        与 get_schema_indexes / get_schema_columns 的批量风格一致。
+        """
+        sql = """
+            SELECT SEQUENCE_NAME, MIN_VALUE, MAX_VALUE, INCREMENT_BY,
+                   CYCLE_FLAG, ORDER_FLAG, CACHE_SIZE, LAST_NUMBER
+            FROM ALL_SEQUENCES
+            WHERE SEQUENCE_OWNER = ?
+            ORDER BY SEQUENCE_NAME
+        """
+        result = self.conn.execute_query(sql, (schema,))
+        sequences: Dict[str, SequenceInfo] = {}
+        for row in result:
+            name, min_v, max_v, incr, cycle, order, cache, _last = row
+            if not name:
+                continue
+            sequences[name] = SequenceInfo(
+                name=name,
+                schema=schema,
+                min_value=min_v,
+                max_value=max_v,
+                increment_by=incr,
+                cycle_flag=cycle,
+                order_flag=order,
+                cache_size=cache,
+            )
+        return sequences
+
     @staticmethod
     def _mark_primary_key_columns(columns: Dict[str, ColumnInfo], pk_columns: Set[str]):
         """标记字段是否属于主键。"""
@@ -575,6 +640,7 @@ class DMMetadataExtractor:
             schema_indexes = self.get_schema_indexes(schema)
             schema_pk_columns = self.get_schema_primary_key_columns(schema)
             identity_flags = self.get_schema_identity_flags(schema)
+            schema_info.sequences = self.get_schema_sequences(schema)
 
             # 一次性批量提取字段，再按表分发，消除逐表 N+1 查询
             schema_columns = self.get_schema_columns(schema)
@@ -598,6 +664,7 @@ class DMMetadataExtractor:
         schema_indexes = self.get_schema_indexes(schema_name)
         schema_pk_columns = self.get_schema_primary_key_columns(schema_name)
         identity_flags = self.get_schema_identity_flags(schema_name)
+        schema_info.sequences = self.get_schema_sequences(schema_name)
 
         # 一次性批量提取字段，再按表分发，消除逐表 N+1 查询
         schema_columns = self.get_schema_columns(schema_name)
@@ -660,6 +727,18 @@ class PrimaryKeyDiff:
 
 
 @dataclasses.dataclass
+class SequenceDiff:
+    """序列差异"""
+    schema: str
+    sequence: str
+    diff_type: str  # '目标端缺失', '源端缺失', '属性变更'
+    test_value: str
+    prod_value: str
+    test_sequence: Optional[SequenceInfo] = None
+    prod_sequence: Optional[SequenceInfo] = None
+
+
+@dataclasses.dataclass
 class SchemaDiff:
     """模式差异"""
     schema: str
@@ -684,6 +763,7 @@ class ComparisonResult:
     column_diffs: List[ColumnDiff] = dataclasses.field(default_factory=list)
     index_diffs: List[IndexDiff] = dataclasses.field(default_factory=list)
     primary_key_diffs: List[PrimaryKeyDiff] = dataclasses.field(default_factory=list)
+    sequence_diffs: List[SequenceDiff] = dataclasses.field(default_factory=list)
 
     # 模式映射信息
     schema_mappings: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -701,6 +781,9 @@ class ComparisonResult:
     test_index_count: int = 0
     prod_index_count: int = 0
     common_index_count: int = 0
+    test_sequence_count: int = 0
+    prod_sequence_count: int = 0
+    common_sequence_count: int = 0
 
 
 @dataclasses.dataclass
@@ -753,11 +836,17 @@ class SchemaComparator:
         logger.info("  对比主键差异...")
         result.primary_key_diffs = self._compare_primary_keys()
 
+        logger.info("  对比序列差异...")
+        result.sequence_diffs = self._compare_sequences()
+
         # 详细的表统计
         result.test_table_count = sum(len(s.tables) for s in self.test_metadata.values())
         result.prod_table_count = sum(len(s.tables) for s in self.prod_metadata.values())
         result.test_index_count = self._count_indexes(self.test_metadata)
         result.prod_index_count = self._count_indexes(self.prod_metadata)
+        result.test_sequence_count = sum(len(s.sequences) for s in self.test_metadata.values())
+        result.prod_sequence_count = sum(len(s.sequences) for s in self.prod_metadata.values())
+        result.common_sequence_count = self._get_common_sequence_count()
 
         # 计算独有模式中的表数量
         test_unique_schemas = set(self.test_metadata.keys()) - set(self.prod_metadata.keys())
@@ -1137,6 +1226,86 @@ class SchemaComparator:
 
         return diffs
 
+    def _compare_sequences(self) -> List[SequenceDiff]:
+        """对比序列差异。序列是 schema 级对象，直接按 schema 名比对序列集合。"""
+        diffs = []
+        common_schemas = set(self.test_metadata.keys()) & set(self.prod_metadata.keys())
+
+        for schema in sorted(common_schemas):
+            test_seqs = self.test_metadata[schema].sequences
+            prod_seqs = self.prod_metadata[schema].sequences
+
+            test_map = self._build_name_map(test_seqs)
+            prod_map = self._build_name_map(prod_seqs)
+            test_names = set(test_map.keys())
+            prod_names = set(prod_map.keys())
+
+            # 仅在源端（目标端缺失）→ CREATE
+            for normalized_name in sorted(test_names - prod_names):
+                name = test_map[normalized_name]
+                seq = test_seqs[name]
+                diffs.append(SequenceDiff(
+                    schema=schema,
+                    sequence=name,
+                    diff_type='目标端缺失',
+                    test_value=seq.get_attribute_string(),
+                    prod_value='-',
+                    test_sequence=seq,
+                ))
+
+            # 仅在目标端（源端缺失）→ 默认不生成 DROP，需人工确认
+            for normalized_name in sorted(prod_names - test_names):
+                name = prod_map[normalized_name]
+                seq = prod_seqs[name]
+                diffs.append(SequenceDiff(
+                    schema=schema,
+                    sequence=name,
+                    diff_type='源端缺失',
+                    test_value='-',
+                    prod_value=seq.get_attribute_string(),
+                    prod_sequence=seq,
+                ))
+
+            # 共有序列属性对比
+            for normalized_name in sorted(test_names & prod_names):
+                test_seq = test_seqs[test_map[normalized_name]]
+                prod_seq = prod_seqs[prod_map[normalized_name]]
+                if self._sequence_attributes_equal(test_seq, prod_seq):
+                    continue
+                diffs.append(SequenceDiff(
+                    schema=schema,
+                    sequence=prod_seq.name,
+                    diff_type='属性变更',
+                    test_value=test_seq.get_attribute_string(),
+                    prod_value=prod_seq.get_attribute_string(),
+                    test_sequence=test_seq,
+                    prod_sequence=prod_seq,
+                ))
+
+        return diffs
+
+    @staticmethod
+    def _sequence_attributes_equal(a: SequenceInfo, b: SequenceInfo) -> bool:
+        """序列属性是否一致。LAST_NUMBER 是运行时状态，不参与结构对比。"""
+        return (
+            (a.increment_by or 0) == (b.increment_by or 0)
+            and (a.min_value or 0) == (b.min_value or 0)
+            and (a.max_value or 0) == (b.max_value or 0)
+            and (a.cycle_flag or '').upper() == (b.cycle_flag or '').upper()
+            and (a.order_flag or '').upper() == (b.order_flag or '').upper()
+            and (a.cache_size or 0) == (b.cache_size or 0)
+        )
+
+    def _get_common_sequence_count(self) -> int:
+        """共同序列数量（同名即算）。"""
+        count = 0
+        common_schemas = set(self.test_metadata.keys()) & set(self.prod_metadata.keys())
+        for schema in common_schemas:
+            test_names = set(self._build_name_map(self.test_metadata[schema].sequences).keys())
+            prod_names = set(self._build_name_map(self.prod_metadata[schema].sequences).keys())
+            count += len(test_names & prod_names)
+        return count
+
     @staticmethod
     def _filter_comparable_indexes(indexes: Dict[str, IndexInfo]) -> Dict[str, IndexInfo]:
         """过滤掉主键/唯一约束背后的索引，这类对象应按约束处理。"""
@@ -1351,6 +1520,9 @@ class ReportGenerator:
         # Sheet6: 主键差异
         self._create_primary_key_diff_sheet(wb, style)
 
+        # Sheet7: 序列差异
+        self._create_sequence_diff_sheet(wb, style)
+
         wb.save(output_path)
 
     def _create_summary_sheet(self, wb: Workbook, style: dict):
@@ -1428,6 +1600,9 @@ class ReportGenerator:
             ('共同索引数量', self.result.common_index_count, self.result.common_index_count, '-'),
             ('索引差异', '-', '-', len(self.result.index_diffs)),
             ('主键差异', '-', '-', len(self.result.primary_key_diffs)),
+            ('序列数量', self.result.test_sequence_count, self.result.prod_sequence_count, '-'),
+            ('共同序列数量', self.result.common_sequence_count, self.result.common_sequence_count, '-'),
+            ('序列差异', '-', '-', len(self.result.sequence_diffs)),
         ]
 
         for r, (label, test_val, prod_val, diff_count) in enumerate(data, row + 1):
@@ -1952,6 +2127,99 @@ class ReportGenerator:
         ws.column_dimensions['F'].width = 45
         ws.column_dimensions['G'].width = 120
 
+    # ---------- 序列差异 ----------
+
+    def _generate_sequence_create_sql(self, seq: SequenceInfo, target_schema: str) -> str:
+        """按序列属性生成 CREATE SEQUENCE 语句。
+
+        不写 START WITH：LAST_NUMBER 是运行时状态而非建序列时的定义，
+        CREATE 默认从 MIN_VALUE 起；需对齐当前值属数据同步范畴，默认不做。
+        """
+        cache_clause = 'NOCACHE' if (seq.cache_size or 0) == 0 else f'CACHE {seq.cache_size}'
+        cycle_clause = 'CYCLE' if (seq.cycle_flag or '').upper() == 'Y' else 'NOCYCLE'
+        order_clause = 'ORDER' if (seq.order_flag or '').upper() == 'Y' else 'NOORDER'
+        qualified = self._qualified_name(target_schema, seq.name)
+        return (
+            f"CREATE SEQUENCE {qualified} "
+            f"INCREMENT BY {seq.increment_by or 1} "
+            f"MINVALUE {seq.min_value or 1} "
+            f"MAXVALUE {seq.max_value or 999999999999999999999999999} "
+            f"{cycle_clause} {cache_clause} {order_clause};"
+        )
+
+    def _generate_sequence_alter_sql(self, seq: SequenceInfo, target_schema: str) -> str:
+        """按源端属性生成 ALTER SEQUENCE 语句。ALTER 不能改 START WITH，与我们的用法一致。"""
+        cache_clause = 'NOCACHE' if (seq.cache_size or 0) == 0 else f'CACHE {seq.cache_size}'
+        cycle_clause = 'CYCLE' if (seq.cycle_flag or '').upper() == 'Y' else 'NOCYCLE'
+        order_clause = 'ORDER' if (seq.order_flag or '').upper() == 'Y' else 'NOORDER'
+        qualified = self._qualified_name(target_schema, seq.name)
+        return (
+            f"ALTER SEQUENCE {qualified} "
+            f"INCREMENT BY {seq.increment_by or 1} "
+            f"MINVALUE {seq.min_value or 1} "
+            f"MAXVALUE {seq.max_value or 999999999999999999999999999} "
+            f"{cycle_clause} {cache_clause} {order_clause};"
+        )
+
+    def _generate_sequence_sync_sql(self, diff: SequenceDiff) -> Optional[str]:
+        """生成序列同步 SQL，以源端定义为目标。"""
+        if diff.diff_type == '目标端缺失':
+            return self._generate_sequence_create_sql(diff.test_sequence, diff.schema) if diff.test_sequence else None
+        if diff.diff_type == '属性变更':
+            return self._generate_sequence_alter_sql(diff.test_sequence, diff.schema) if diff.test_sequence else None
+        # 源端缺失：目标端独有序列，默认不生成 DROP，需人工确认
+        return None
+
+    def _get_sequence_sync_advice(self, diff: SequenceDiff) -> str:
+        if diff.diff_type == '目标端缺失':
+            return '目标端缺失序列，可按源端创建（默认从 MIN_VALUE 起，需对齐当前值请手工处理）'
+        if diff.diff_type == '属性变更':
+            return '序列属性不一致，确认后按源端 ALTER'
+        if diff.diff_type == '源端缺失':
+            return '目标端独有序列，需人工确认；默认不生成 DROP SQL'
+        return ''
+
+    def _create_sequence_diff_sheet(self, wb: Workbook, style: dict):
+        """创建序列差异 sheet"""
+        ws = wb.create_sheet('序列差异')
+
+        sl = self.result.source_label
+        tl = self.result.target_label
+        headers = ['模式名', '序列名', '差异类型',
+                   f'{sl}属性', f'{tl}属性', '同步建议', '同步SQL']
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.font = style['title_font']
+            cell.fill = style['title_fill']
+            cell.alignment = style['title_alignment']
+            cell.border = style['thin_border']
+
+        for row, diff in enumerate(self.result.sequence_diffs, 2):
+            ws.cell(row=row, column=1, value=diff.schema).border = style['thin_border']
+            ws.cell(row=row, column=2, value=diff.sequence).border = style['thin_border']
+            cell = ws.cell(row=row, column=3, value=diff.diff_type)
+            cell.border = style['thin_border']
+            if diff.diff_type == '源端缺失':
+                cell.fill = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
+            elif diff.diff_type == '目标端缺失':
+                cell.fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
+            elif diff.diff_type == '属性变更':
+                cell.fill = PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid')
+            ws.cell(row=row, column=4, value=diff.test_value).border = style['thin_border']
+            ws.cell(row=row, column=5, value=diff.prod_value).border = style['thin_border']
+            ws.cell(row=row, column=6, value=self._get_sequence_sync_advice(diff)).border = style['thin_border']
+            sql_cell = ws.cell(row=row, column=7, value=self._generate_sequence_sync_sql(diff) or '')
+            sql_cell.border = style['thin_border']
+            sql_cell.alignment = Alignment(wrap_text=True, vertical='top')
+
+        ws.column_dimensions['A'].width = 20
+        ws.column_dimensions['B'].width = 35
+        ws.column_dimensions['C'].width = 15
+        ws.column_dimensions['D'].width = 55
+        ws.column_dimensions['E'].width = 55
+        ws.column_dimensions['F'].width = 45
+        ws.column_dimensions['G'].width = 120
+
 
 def load_config(config_path: str) -> configparser.ConfigParser:
     """加载配置文件"""
@@ -2281,6 +2549,7 @@ def run_compare(config_path: str, progress_callback: Optional[Callable[[str], No
         emit(f"  - 字段差异: {len(result.column_diffs)}个")
         emit(f"  - 索引差异: {len(result.index_diffs)}个")
         emit(f"  - 主键差异: {len(result.primary_key_diffs)}个")
+        emit(f"  - 序列差异: {len(result.sequence_diffs)}个")
         return CompareRunResult(result=result, report_path=report_path, output_dir=output_dir)
 
     finally:
@@ -2305,6 +2574,9 @@ def build_summary_rows(result: ComparisonResult) -> List[Dict[str, Any]]:
         {'项目': '共同索引数量', sl: result.common_index_count, tl: result.common_index_count, '差异数量': '-'},
         {'项目': '索引差异', sl: '-', tl: '-', '差异数量': len(result.index_diffs)},
         {'项目': '主键差异', sl: '-', tl: '-', '差异数量': len(result.primary_key_diffs)},
+        {'项目': '序列数量', sl: result.test_sequence_count, tl: result.prod_sequence_count, '差异数量': '-'},
+        {'项目': '共同序列数量', sl: result.common_sequence_count, tl: result.common_sequence_count, '差异数量': '-'},
+        {'项目': '序列差异', sl: '-', tl: '-', '差异数量': len(result.sequence_diffs)},
     ]
 
 
@@ -2383,6 +2655,24 @@ def build_primary_key_diff_rows(result: ComparisonResult) -> List[Dict[str, Any]
             '同步SQL': generator._generate_pk_sync_sql(diff) or '',
         }
         for diff in result.primary_key_diffs
+    ]
+
+
+def build_sequence_diff_rows(result: ComparisonResult) -> List[Dict[str, Any]]:
+    sl = result.source_label
+    tl = result.target_label
+    generator = ReportGenerator(result)
+    return [
+        {
+            '模式名': diff.schema,
+            '序列名': diff.sequence,
+            '差异类型': diff.diff_type,
+            f'{sl}属性': diff.test_value,
+            f'{tl}属性': diff.prod_value,
+            '同步建议': generator._get_sequence_sync_advice(diff),
+            '同步SQL': generator._generate_sequence_sync_sql(diff) or '',
+        }
+        for diff in result.sequence_diffs
     ]
 
 

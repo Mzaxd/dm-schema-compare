@@ -22,6 +22,7 @@ from dm_compare import (
     build_index_diff_rows,
     build_primary_key_diff_rows,
     build_schema_diff_rows,
+    build_sequence_diff_rows,
     build_summary_rows,
     build_table_diff_rows,
     load_config,
@@ -628,6 +629,7 @@ def render_result(config_path: str):
         st.metric('字段差异', len(result.column_diffs))
         st.metric('索引差异', len(result.index_diffs))
         st.metric('主键差异', len(result.primary_key_diffs))
+        st.metric('序列差异', len(result.sequence_diffs))
         st.metric('模式差异', len(result.schema_diffs))
 
         if os.path.exists(run_result.report_path):
@@ -639,7 +641,7 @@ def render_result(config_path: str):
                     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
                 )
 
-    tabs = st.tabs(['汇总概览', '表差异', '字段差异', '索引差异', '主键差异', '模式差异'])
+    tabs = st.tabs(['汇总概览', '表差异', '字段差异', '索引差异', '主键差异', '序列差异', '模式差异'])
     with tabs[0]:
         render_summary_table(build_summary_rows(result))
     with tabs[1]:
@@ -651,6 +653,8 @@ def render_result(config_path: str):
     with tabs[4]:
         render_dataframe('主键差异', build_primary_key_diff_rows(result), config_path=config_path)
     with tabs[5]:
+        render_dataframe('序列差异', build_sequence_diff_rows(result), config_path=config_path)
+    with tabs[6]:
         render_schema_diff(build_schema_diff_rows(result))
 
 
