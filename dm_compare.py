@@ -6,6 +6,7 @@
 """
 
 import configparser
+import fnmatch
 import logging
 import os
 import re
@@ -187,6 +188,7 @@ class SequenceInfo:
     cycle_flag: Optional[str]   # 'Y' / 'N'
     order_flag: Optional[str]   # 'Y' / 'N'
     cache_size: Optional[int]   # 0 表示 NOCACHE
+    start_with: Optional[int] = None  # 建序列起始值，仅存在于 DDL
 
     def __hash__(self):
         return hash((self.schema, self.name))
@@ -200,6 +202,7 @@ class SequenceInfo:
         """紧凑属性串，用于对比展示。"""
         cache = 'NOCACHE' if (self.cache_size or 0) == 0 else f'CACHE {self.cache_size}'
         return (
+            f"START_WITH={self.start_with}, "
             f"INCREMENT_BY={self.increment_by}, "
             f"MIN_VALUE={self.min_value}, "
             f"MAX_VALUE={self.max_value}, "
@@ -509,11 +512,14 @@ class DMMetadataExtractor:
 
         return table_columns
 
-    def get_schema_sequences(self, schema: str) -> Dict[str, SequenceInfo]:
-        """一次查询获取模式下所有序列，按序列名分组。
+    def get_schema_sequences(self, schema: str,
+                             exclude_patterns: Optional[List[str]] = None) -> Dict[str, SequenceInfo]:
+        """一次查询获取模式下所有序列，再逐个解析 START WITH。
 
-        ALL_SEQUENCES 已含全部建序列所需属性，无需再调 DBMS_METADATA.GET_DDL，
-        与 get_schema_indexes / get_schema_columns 的批量风格一致。
+        ALL_SEQUENCES 不存 START WITH（只存 LAST_NUMBER 当前值），起始值只在
+        DDL 里，必须 DBMS_METADATA.GET_DDL 取。序列数通常几十个，N+1 可接受，
+        与 get_table_identity_params 按对象调 GET_DDL 的风格一致。
+        exclude_patterns 命名的序列跳过（含 GET_DDL），用于挡框架元数据噪音。
         """
         sql = """
             SELECT SEQUENCE_NAME, MIN_VALUE, MAX_VALUE, INCREMENT_BY,
@@ -528,6 +534,8 @@ class DMMetadataExtractor:
             name, min_v, max_v, incr, cycle, order, cache, _last = row
             if not name:
                 continue
+            if _is_name_excluded(name, exclude_patterns):
+                continue
             sequences[name] = SequenceInfo(
                 name=name,
                 schema=schema,
@@ -538,7 +546,26 @@ class DMMetadataExtractor:
                 order_flag=order,
                 cache_size=cache,
             )
+
+        for name, seq in sequences.items():
+            seq.start_with = self._get_sequence_start_with(schema, name)
+
         return sequences
+
+    def _get_sequence_start_with(self, schema: str, sequence_name: str) -> Optional[int]:
+        """从建序列 DDL 解析 START WITH。ALL_SEQUENCES 不暴露此属性。"""
+        sql = "SELECT DBMS_METADATA.GET_DDL('SEQUENCE', ?, ?) FROM DUAL"
+        result = self.conn.execute_query(sql, (sequence_name, schema))
+        if not result:
+            return None
+
+        ddl = result[0][0]
+        if hasattr(ddl, 'read'):
+            ddl = ddl.read()
+        ddl_text = str(ddl) or ''
+
+        match = re.search(r'START\s+WITH\s+(-?\d+)', ddl_text, re.IGNORECASE)
+        return int(match.group(1)) if match else None
 
     @staticmethod
     def _mark_primary_key_columns(columns: Dict[str, ColumnInfo], pk_columns: Set[str]):
@@ -620,7 +647,8 @@ class DMMetadataExtractor:
                 column.identity_start = start
                 column.identity_increment = incr
 
-    def extract_all_metadata(self, exclude_schemas: Set[str] = None) -> Dict[str, SchemaInfo]:
+    def extract_all_metadata(self, exclude_schemas: Set[str] = None,
+                             exclude_sequence_patterns: Optional[List[str]] = None) -> Dict[str, SchemaInfo]:
         """提取所有元数据"""
         if exclude_schemas is None:
             exclude_schemas = set()
@@ -640,7 +668,7 @@ class DMMetadataExtractor:
             schema_indexes = self.get_schema_indexes(schema)
             schema_pk_columns = self.get_schema_primary_key_columns(schema)
             identity_flags = self.get_schema_identity_flags(schema)
-            schema_info.sequences = self.get_schema_sequences(schema)
+            schema_info.sequences = self.get_schema_sequences(schema, exclude_sequence_patterns)
 
             # 一次性批量提取字段，再按表分发，消除逐表 N+1 查询
             schema_columns = self.get_schema_columns(schema)
@@ -656,7 +684,8 @@ class DMMetadataExtractor:
 
         return metadata
 
-    def extract_single_schema(self, schema_name: str) -> SchemaInfo:
+    def extract_single_schema(self, schema_name: str,
+                              exclude_sequence_patterns: Optional[List[str]] = None) -> SchemaInfo:
         """只提取指定模式的元数据（用于多连接场景）"""
         logger.info("  提取模式 %s...", schema_name)
         schema_info = SchemaInfo(name=schema_name)
@@ -664,7 +693,7 @@ class DMMetadataExtractor:
         schema_indexes = self.get_schema_indexes(schema_name)
         schema_pk_columns = self.get_schema_primary_key_columns(schema_name)
         identity_flags = self.get_schema_identity_flags(schema_name)
-        schema_info.sequences = self.get_schema_sequences(schema_name)
+        schema_info.sequences = self.get_schema_sequences(schema_name, exclude_sequence_patterns)
 
         # 一次性批量提取字段，再按表分发，消除逐表 N+1 查询
         schema_columns = self.get_schema_columns(schema_name)
@@ -1288,7 +1317,8 @@ class SchemaComparator:
     def _sequence_attributes_equal(a: SequenceInfo, b: SequenceInfo) -> bool:
         """序列属性是否一致。LAST_NUMBER 是运行时状态，不参与结构对比。"""
         return (
-            (a.increment_by or 0) == (b.increment_by or 0)
+            (a.start_with or 0) == (b.start_with or 0)
+            and (a.increment_by or 0) == (b.increment_by or 0)
             and (a.min_value or 0) == (b.min_value or 0)
             and (a.max_value or 0) == (b.max_value or 0)
             and (a.cycle_flag or '').upper() == (b.cycle_flag or '').upper()
@@ -2132,20 +2162,25 @@ class ReportGenerator:
     def _generate_sequence_create_sql(self, seq: SequenceInfo, target_schema: str) -> str:
         """按序列属性生成 CREATE SEQUENCE 语句。
 
-        不写 START WITH：LAST_NUMBER 是运行时状态而非建序列时的定义，
-        CREATE 默认从 MIN_VALUE 起；需对齐当前值属数据同步范畴，默认不做。
+        START WITH 取建序列起始值（来自 GET_DDL，非 LAST_NUMBER 当前值）；
+        同步的是定义，不是运行时状态。
         """
         cache_clause = 'NOCACHE' if (seq.cache_size or 0) == 0 else f'CACHE {seq.cache_size}'
         cycle_clause = 'CYCLE' if (seq.cycle_flag or '').upper() == 'Y' else 'NOCYCLE'
         order_clause = 'ORDER' if (seq.order_flag or '').upper() == 'Y' else 'NOORDER'
         qualified = self._qualified_name(target_schema, seq.name)
-        return (
-            f"CREATE SEQUENCE {qualified} "
-            f"INCREMENT BY {seq.increment_by or 1} "
-            f"MINVALUE {seq.min_value or 1} "
-            f"MAXVALUE {seq.max_value or 999999999999999999999999999} "
-            f"{cycle_clause} {cache_clause} {order_clause};"
-        )
+        start_clause = f'START WITH {seq.start_with}' if seq.start_with is not None else ''
+        parts = [
+            f"CREATE SEQUENCE {qualified}",
+            f"INCREMENT BY {seq.increment_by or 1}",
+            start_clause,
+            f"MINVALUE {seq.min_value or 1}",
+            f"MAXVALUE {seq.max_value or 999999999999999999999999999}",
+            cycle_clause,
+            cache_clause,
+            order_clause,
+        ]
+        return ' '.join(part for part in parts if part) + ';'
 
     def _generate_sequence_alter_sql(self, seq: SequenceInfo, target_schema: str) -> str:
         """按源端属性生成 ALTER SEQUENCE 语句。ALTER 不能改 START WITH，与我们的用法一致。"""
@@ -2172,9 +2207,13 @@ class ReportGenerator:
 
     def _get_sequence_sync_advice(self, diff: SequenceDiff) -> str:
         if diff.diff_type == '目标端缺失':
-            return '目标端缺失序列，可按源端创建（默认从 MIN_VALUE 起，需对齐当前值请手工处理）'
+            return '目标端缺失序列，可按源端创建（含 START WITH 起始值；当前值不同步）'
         if diff.diff_type == '属性变更':
-            return '序列属性不一致，确认后按源端 ALTER'
+            extra = ''
+            if (diff.test_sequence and diff.prod_sequence
+                    and (diff.test_sequence.start_with or 0) != (diff.prod_sequence.start_with or 0)):
+                extra = '；START WITH 不同，ALTER 改不了，需手动 DROP+CREATE'
+            return '序列属性不一致，确认后按源端 ALTER' + extra
         if diff.diff_type == '源端缺失':
             return '目标端独有序列，需人工确认；默认不生成 DROP SQL'
         return ''
@@ -2234,6 +2273,26 @@ def parse_exclude_schemas(schemas_str: str) -> Set[str]:
     if not schemas_str:
         return set()
     return set(s.strip() for s in schemas_str.split(',') if s.strip())
+
+
+# 框架元数据序列默认排除：Liquibase 建表时附带、但实际无列引用的悬空序列。
+# 见 ALL_TAB_COLUMNS 无 .NEXTVAL 引用，属纯噪音。
+DEFAULT_EXCLUDE_SEQUENCES: List[str] = ['DATABASECHANGELOG*', 'DATABASECHANGELOGLOCK*']
+
+
+def parse_exclude_sequences(patterns_str: str) -> List[str]:
+    """解析排除的序列名模式列表，支持 glob 通配符(* ?)，大小写不敏感。"""
+    if not patterns_str:
+        return []
+    return [p.strip().upper() for p in patterns_str.split(',') if p.strip()]
+
+
+def _is_name_excluded(name: str, patterns: Optional[List[str]]) -> bool:
+    """按 glob 模式判断对象名是否应排除（大小写不敏感，跨平台一致）。"""
+    if not patterns:
+        return False
+    upper_name = (name or '').upper()
+    return any(fnmatch.fnmatchcase(upper_name, p) for p in patterns)
 
 
 def parse_schema_mapping(mapping_str: str) -> Dict[str, str]:
@@ -2423,6 +2482,10 @@ def run_compare(config_path: str, progress_callback: Optional[Callable[[str], No
 
     # 解析公共配置
     exclude_schemas = parse_exclude_schemas(config.get('options', 'exclude_schemas', fallback=''))
+    exclude_sequence_patterns = list(dict.fromkeys(
+        DEFAULT_EXCLUDE_SEQUENCES
+        + parse_exclude_sequences(config.get('options', 'exclude_sequences', fallback=''))
+    ))
     schema_mapping = parse_schema_mapping(config.get('options', 'schema_mapping', fallback=''))
     output_dir = config.get('options', 'output_dir', fallback='./reports')
     source_label = config.get('options', 'source_label', fallback='源端')
@@ -2461,7 +2524,7 @@ def run_compare(config_path: str, progress_callback: Optional[Callable[[str], No
         for i, (conn, schema_cfg) in enumerate(zip(source_conns, source_configs), 1):
             emit(f"  [{i}/{len(source_conns)}] 从连接提取模式 {schema_cfg.schema}...")
             extractor = DMMetadataExtractor(conn)
-            schema_info = extractor.extract_single_schema(schema_cfg.schema)
+            schema_info = extractor.extract_single_schema(schema_cfg.schema, exclude_sequence_patterns)
             test_metadata[schema_cfg.schema] = schema_info
 
         test_host, test_port = '', 0
@@ -2481,7 +2544,7 @@ def run_compare(config_path: str, progress_callback: Optional[Callable[[str], No
 
         emit(f"[4/7] 提取 {source_label} 元数据...")
         test_extractor = DMMetadataExtractor(test_conn)
-        test_metadata = test_extractor.extract_all_metadata(exclude_schemas)
+        test_metadata = test_extractor.extract_all_metadata(exclude_schemas, exclude_sequence_patterns)
 
     # ---------- 目标端连接 & 元数据 ----------
     if mode == 'dual':
@@ -2511,7 +2574,7 @@ def run_compare(config_path: str, progress_callback: Optional[Callable[[str], No
         for i, (conn, schema_cfg) in enumerate(zip(prod_conns, prod_schema_configs), 1):
             emit(f"  [{i}/{len(prod_conns)}] 从连接提取模式 {schema_cfg.schema}...")
             extractor = DMMetadataExtractor(conn)
-            schema_info = extractor.extract_single_schema(schema_cfg.schema)
+            schema_info = extractor.extract_single_schema(schema_cfg.schema, exclude_sequence_patterns)
             prod_metadata[schema_cfg.schema] = schema_info
 
         # 应用模式映射
