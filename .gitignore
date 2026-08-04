@@ -7,3 +7,6 @@ __pycache__/
 *.pyc
 .DS_Store
 .streamlit/secrets.toml
+
+# 运行时对比结果输出（UAT/PROD 差异、菜单同步等临时产物）
+_*.txt
