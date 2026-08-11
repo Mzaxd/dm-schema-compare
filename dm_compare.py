@@ -2112,6 +2112,12 @@ class ReportGenerator:
                 column_sql += " NOT NULL"
             column_lines.append(column_sql)
 
+        # PRIMARY KEY 内联到 CREATE TABLE，避免单独 ALTER TABLE ADD PRIMARY KEY
+        # 产生多余的自动命名索引
+        if table.primary_key_columns:
+            pk_cols = ', '.join(self._quote_identifier(c) for c in table.primary_key_columns)
+            column_lines.append(f"    PRIMARY KEY ({pk_cols})")
+
         columns_sql = ",\n".join(column_lines)
         statements = [
             f"CREATE TABLE {table_name} (\n{columns_sql}\n);"
@@ -2125,7 +2131,10 @@ class ReportGenerator:
                 column_name = f"{table_name}.{self._quote_identifier(column.name)}"
                 statements.append(f"COMMENT ON COLUMN {column_name} IS '{self._escape_sql_literal(column.comment)}';")
 
+        # 只为非约束索引生成 CREATE INDEX，约束索引由 PK/UK 约束自动创建
         for index in table.indexes.values():
+            if index.is_constraint_backed():
+                continue
             index_sql = self._generate_create_index_sql(index, target_schema=target_schema)
             if index_sql:
                 statements.append(index_sql)
