@@ -2979,6 +2979,13 @@ def apply_schema_mapping(metadata: Dict[str, SchemaInfo],
             # 保持原名
             new_metadata[old_schema_name] = schema_info
 
+    # 重映射外键引用的模式名（ref_schema），避免跨环境 schema 不同名时误报差异
+    for schema_info in new_metadata.values():
+        for table_info in schema_info.tables.values():
+            for fk in table_info.foreign_keys.values():
+                if fk.ref_schema in mapping:
+                    fk.ref_schema = mapping[fk.ref_schema]
+
     if applied_mapping:
         logger.info("  [%s] 共应用了 %d 个模式映射", env_name, len(applied_mapping))
 
