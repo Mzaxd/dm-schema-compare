@@ -19,12 +19,14 @@ from dm_compare import (
     DMConnection,
     SchemaConnectionConfig,
     build_column_diff_rows,
+    build_foreign_key_diff_rows,
     build_index_diff_rows,
     build_primary_key_diff_rows,
-    build_schema_diff_rows,
+    build_procedure_diff_rows,
     build_sequence_diff_rows,
     build_summary_rows,
     build_table_diff_rows,
+    build_view_diff_rows,
     load_config,
     load_prod_schema_configs,
     load_schema_configs,
@@ -117,7 +119,7 @@ def build_row_label(row: pd.Series) -> str:
     schema = row.get('模式名', '')
     table = row.get('表名', '')
     name = row.get('字段名') or row.get('索引名') or ''
-    diff_type = row.get('差异类型') or row.get('所在环境') or ''
+    diff_type = row.get('差异类型') or ''
     return ' / '.join(str(part) for part in (schema, table, name, diff_type) if str(part))
 
 
@@ -570,24 +572,6 @@ def render_summary_table(rows: List[Dict[str, object]]):
     st.dataframe(df, width='stretch', hide_index=True)
 
 
-def render_schema_diff(rows: List[Dict[str, object]]):
-    """渲染模式差异。"""
-    st.subheader('模式差异')
-    df = to_dataframe(rows)
-    if df.empty:
-        st.info('没有差异')
-        return
-    st.dataframe(
-        df,
-        width='stretch',
-        height=620,
-        hide_index=True,
-        key='diff_table_模式差异',
-        on_select='rerun',
-        selection_mode='multi-row'
-    )
-
-
 def render_config_summary(config_summary: Dict[str, object]):
     """渲染脱敏配置摘要。"""
     source_label = config_summary.get('source_label', '源端')
@@ -630,7 +614,9 @@ def render_result(config_path: str):
         st.metric('索引差异', len(result.index_diffs))
         st.metric('主键差异', len(result.primary_key_diffs))
         st.metric('序列差异', len(result.sequence_diffs))
-        st.metric('模式差异', len(result.schema_diffs))
+        st.metric('外键差异', len(result.foreign_key_diffs))
+        st.metric('视图差异', len(result.view_diffs))
+        st.metric('过程/函数/触发器差异', len(result.procedure_diffs))
 
         if os.path.exists(run_result.report_path):
             with open(run_result.report_path, 'rb') as report_file:
@@ -641,7 +627,8 @@ def render_result(config_path: str):
                     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
                 )
 
-    tabs = st.tabs(['汇总概览', '表差异', '字段差异', '索引差异', '主键差异', '序列差异', '模式差异'])
+    tabs = st.tabs(['汇总概览', '表差异', '字段差异', '索引差异', '主键差异', '序列差异',
+                     '外键差异', '视图差异', '过程函数触发器差异'])
     with tabs[0]:
         render_summary_table(build_summary_rows(result))
     with tabs[1]:
@@ -655,7 +642,11 @@ def render_result(config_path: str):
     with tabs[5]:
         render_dataframe('序列差异', build_sequence_diff_rows(result), config_path=config_path)
     with tabs[6]:
-        render_schema_diff(build_schema_diff_rows(result))
+        render_dataframe('外键差异', build_foreign_key_diff_rows(result), config_path=config_path)
+    with tabs[7]:
+        render_dataframe('视图差异', build_view_diff_rows(result), sql_column='', config_path=config_path)
+    with tabs[8]:
+        render_dataframe('过程函数触发器差异', build_procedure_diff_rows(result), sql_column='', config_path=config_path)
 
 
 def main():
