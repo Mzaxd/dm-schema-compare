@@ -3339,6 +3339,111 @@ def build_procedure_diff_rows(result: ComparisonResult) -> List[Dict[str, Any]]:
     ]
 
 
+def generate_deployment_script(result: ComparisonResult) -> str:
+    """生成按依赖关系排序的完整部署脚本。
+
+    排序规则（phase 越小越先执行）：
+      1. CREATE TABLE  — 被引用的表必须先存在
+      2. ADD COLUMN    — 字段必须先存在才能建约束/索引
+      3. MODIFY COLUMN — 类型/长度/精度/可空性/默认值变更
+      4. PRIMARY KEY   — 主键依赖列就绪
+      5. INDEX         — 索引依赖列就绪
+      6. SEQUENCE      — 独立对象，靠后
+      7. FOREIGN KEY   — 最后，引用表和列都已就绪
+      8. COMMENT       — 不影响结构，放最后
+    """
+    generator = ReportGenerator(result)
+    # (phase, schema, table, sort_key, sql)
+    items: List[Tuple[int, str, str, str, str]] = []
+
+    # Phase 1: CREATE TABLE
+    for diff in result.table_diffs:
+        if diff.diff_type == '目标端缺失':
+            sql = generator._generate_table_sync_sql(diff)
+            if sql:
+                items.append((1, diff.schema, diff.table, diff.table, sql))
+
+    # Phase 2-3: 字段差异（ADD 先于 MODIFY）
+    for diff in result.column_diffs:
+        sql = generator._generate_sync_sql(
+            diff.schema, diff.table, diff.column,
+            diff.diff_type, diff.test_value, diff.prod_value,
+            diff.test_column,
+        )
+        if not sql:
+            continue
+        if diff.diff_type == '目标端缺失':
+            items.append((2, diff.schema, diff.table, diff.column, sql))
+        elif diff.diff_type == '注释变更':
+            items.append((8, diff.schema, diff.table, diff.column, sql))
+        else:
+            # 类型/长度/精度/可空性/默认值变更
+            items.append((3, diff.schema, diff.table, diff.column, sql))
+
+    # Phase 4: PRIMARY KEY
+    for diff in result.primary_key_diffs:
+        sql = generator._generate_pk_sync_sql(diff)
+        if sql:
+            items.append((4, diff.schema, diff.table, diff.table, sql))
+
+    # Phase 5: INDEX
+    for diff in result.index_diffs:
+        sql = generator._generate_index_sync_sql(diff)
+        if sql:
+            items.append((5, diff.schema, diff.table, diff.index, sql))
+
+    # Phase 6: SEQUENCE
+    for diff in result.sequence_diffs:
+        sql = generator._generate_sequence_sync_sql(diff)
+        if sql:
+            items.append((6, diff.schema, '', diff.sequence, sql))
+
+    # Phase 7: FOREIGN KEY
+    for diff in result.foreign_key_diffs:
+        sql = generator._generate_fk_sync_sql(diff)
+        if sql:
+            items.append((7, diff.schema, diff.table, diff.fk_name, sql))
+
+    items.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+
+    phase_labels = {
+        1: '-- 1. 建表（CREATE TABLE）',
+        2: '-- 2. 加字段（ADD COLUMN）',
+        3: '-- 3. 改字段（MODIFY COLUMN）',
+        4: '-- 4. 主键（PRIMARY KEY）',
+        5: '-- 5. 索引（INDEX）',
+        6: '-- 6. 序列（SEQUENCE）',
+        7: '-- 7. 外键（FOREIGN KEY）',
+        8: '-- 8. 注释（COMMENT）',
+    }
+
+    lines = [
+        '-- ============================================',
+        '-- 达梦数据库结构同步部署脚本（按依赖排序）',
+        f'-- 源端: {result.source_label}',
+        f'-- 目标端: {result.target_label}',
+        f'-- 生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
+        '-- ============================================',
+        '',
+    ]
+
+    current_phase = 0
+    for phase, _schema, _table, _key, sql in items:
+        if phase != current_phase:
+            current_phase = phase
+            lines.append('')
+            lines.append(phase_labels.get(phase, f'-- {phase}'))
+            lines.append('')
+        lines.append(sql)
+        if not sql.endswith('\n'):
+            lines.append('')
+
+    if not items:
+        lines.append('-- 无差异，空脚本')
+
+    return '\n'.join(lines)
+
+
 def main():
     """主函数"""
     script_dir = os.path.dirname(os.path.abspath(__file__))

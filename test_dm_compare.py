@@ -179,6 +179,43 @@ def test_is_name_excluded():
     assert not _is_name_excluded('MY_TABLE', None)
 
 
+def test_deployment_script_ordering():
+    """部署脚本必须按依赖顺序排列：建表→加字段→改字段→主键→索引→序列→外键→注释。"""
+    from dm_compare import (
+        ComparisonResult, ColumnDiff, TableDiff, TableInfo, ColumnInfo,
+        generate_deployment_script,
+    )
+    result = ComparisonResult()
+    # 构造一张有字段的表，让 _generate_table_sync_sql 能输出 CREATE TABLE
+    new_table = TableInfo(name='NEW_T', schema='S', table_type='TABLE')
+    new_table.columns = {
+        'id': ColumnInfo('id', 'INT', None, None, None, 'N', None),
+    }
+    # 模拟混合差异：故意打乱插入顺序
+    result.column_diffs = [
+        ColumnDiff(schema='S', table='T', column='c2', diff_type='注释变更',
+                   test_value='注释', prod_value='-', test_column=ColumnInfo('c2', 'INT', None, None, None, 'Y', None)),
+        ColumnDiff(schema='S', table='T', column='c1', diff_type='目标端缺失',
+                   test_value='INT', prod_value='-', test_column=ColumnInfo('c1', 'INT', None, None, None, 'Y', None)),
+    ]
+    result.table_diffs = [
+        TableDiff(schema='S', table='NEW_T', diff_type='目标端缺失',
+                  test_table=new_table),
+    ]
+
+    script = generate_deployment_script(result)
+    # Phase 标题必须按序出现
+    assert '-- 1. 建表' in script
+    assert '-- 2. 加字段' in script
+    assert '-- 8. 注释' in script
+    # 建表 section 必须在加字段 section 之前
+    assert script.index('-- 1. 建表') < script.index('-- 2. 加字段')
+    # 加字段 section 必须在注释 section 之前
+    assert script.index('-- 2. 加字段') < script.index('-- 8. 注释')
+    # CREATE TABLE 语句确实生成
+    assert 'CREATE TABLE' in script
+
+
 def run_all():
     tests = [
         test_normalize_dm_data_type,
@@ -192,6 +229,7 @@ def run_all():
         test_normalize_default_for_compare,
         test_quote_identifier,
         test_is_name_excluded,
+        test_deployment_script_ordering,
     ]
     passed = 0
     failed = 0

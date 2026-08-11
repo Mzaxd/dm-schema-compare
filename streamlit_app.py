@@ -27,6 +27,7 @@ from dm_compare import (
     build_summary_rows,
     build_table_diff_rows,
     build_view_diff_rows,
+    generate_deployment_script,
     load_config,
     load_prod_schema_configs,
     load_schema_configs,
@@ -626,6 +627,20 @@ def render_result(config_path: str):
                     file_name=os.path.basename(run_result.report_path),
                     mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
                 )
+
+        st.divider()
+        deploy_script = generate_deployment_script(result)
+        diff_total = (len(result.table_diffs) + len(result.column_diffs)
+                      + len(result.index_diffs) + len(result.primary_key_diffs)
+                      + len(result.sequence_diffs) + len(result.foreign_key_diffs))
+        st.download_button(
+            '⬇ 下载完整部署脚本（已排序）',
+            deploy_script.encode('utf-8'),
+            file_name=f'deploy_{datetime.now().strftime("%Y%m%d_%H%M%S")}.sql',
+            mime='text/plain',
+            help=f'按依赖关系排序：建表→加字段→改字段→主键→索引→序列→外键→注释。共 {diff_total} 条差异。',
+            disabled=(diff_total == 0),
+        )
 
     tabs = st.tabs(['汇总概览', '表差异', '字段差异', '索引差异', '主键差异', '序列差异',
                      '外键差异', '视图差异', '过程函数触发器差异'])
