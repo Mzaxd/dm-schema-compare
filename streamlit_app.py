@@ -302,6 +302,40 @@ def get_target_config_map(config: configparser.ConfigParser):
     return {item.schema: item for item in items}
 
 
+DEFAULT_DDL_TUNING = {'enabled': True, 'alter_table_opt': 3, 'ddl_wait_time': 60}
+
+# -6407 锁超时的可操作提示：引导定位阻塞 DDL 的未提交事务
+LOCK_TIMEOUT_HINT = (
+    '。提示: 表上存在未提交事务阻塞 DDL，可执行 SELECT * FROM V$TRXWAIT; '
+    '定位阻塞源（配合 V$LOCK / V$SESSIONS 查会话详情），待事务结束或低峰期重试；'
+    '确认无用会话可 sp_close_session(sess_id) 关闭'
+)
+
+
+def load_ddl_tuning_config(config: configparser.ConfigParser) -> Dict[str, object]:
+    """读取 [ddl_tuning] 会话级 DDL 优化配置；缺段/缺项/非法值回退内置默认。"""
+    tuning = dict(DEFAULT_DDL_TUNING)
+    if not config.has_section('ddl_tuning'):
+        return tuning
+    section = config['ddl_tuning']
+    try:
+        tuning['enabled'] = section.getboolean('enabled', fallback=tuning['enabled'])
+    except ValueError:
+        logger.warning("[DDL优化] enabled 配置非法，回退默认 true")
+    for key in ('alter_table_opt', 'ddl_wait_time'):
+        try:
+            tuning[key] = section.getint(key, fallback=tuning[key])
+        except ValueError:
+            logger.warning("[DDL优化] %s 配置非法，回退默认 %s", key, tuning[key])
+    return tuning
+
+
+def is_lock_timeout_error(exc: BaseException) -> bool:
+    """判断异常是否为达梦 -6407 锁超时（DDL 等表排它锁超时）。"""
+    text = str(exc)
+    return any(marker in text for marker in ('6407', '锁超时', 'Lock request timeout'))
+
+
 def execute_selected_sql(selected_df: pd.DataFrame,
                          sql_column: str,
                          allow_repeat: bool = False,
@@ -310,6 +344,7 @@ def execute_selected_sql(selected_df: pd.DataFrame,
     """按模式路由到目标端数据库执行选中SQL。"""
     config = load_config(config_path or os.path.join(SCRIPT_DIR, 'config.ini'))
     prod_config_map = get_target_config_map(config)
+    ddl_tuning = load_ddl_tuning_config(config)
     connections: Dict[str, DMConnection] = {}
     results = []
     execution_state = load_execution_state()
@@ -358,6 +393,14 @@ def execute_selected_sql(selected_df: pd.DataFrame,
                         'SQL': sql_text
                     })
                     continue
+                if ddl_tuning['enabled']:
+                    applied = connection.apply_ddl_session_tuning(
+                        ddl_tuning['alter_table_opt'],
+                        ddl_tuning['ddl_wait_time']
+                    )
+                    if applied:
+                        logger.info("[审计] DDL会话优化 | 模式=%s | %s（仅本会话，断开自动失效）",
+                                    schema, ', '.join(applied))
                 connections[schema] = connection
 
             statements = split_sql_statements(sql_text)
@@ -377,10 +420,13 @@ def execute_selected_sql(selected_df: pd.DataFrame,
                 except Exception as exc:
                     if hasattr(connections[schema].conn, 'rollback'):
                         connections[schema].conn.rollback()
+                    fail_message = f'失败: {exc}'
+                    if is_lock_timeout_error(exc):
+                        fail_message += LOCK_TIMEOUT_HINT
                     results.append({
                         '模式名': schema,
                         '对象': build_row_label(row),
-                        '执行结果': f'失败: {exc}',
+                        '执行结果': fail_message,
                         'SQL': statement
                     })
                     log_sql = ' '.join(statement.split())[:200]

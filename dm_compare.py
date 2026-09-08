@@ -411,6 +411,44 @@ class DMConnection:
         finally:
             cursor.close()
 
+    def apply_ddl_session_tuning(self, alter_table_opt: int = 3,
+                                 ddl_wait_time: int = 60) -> List[str]:
+        """会话级启用 DDL 优化：快速加列 + 延长 DDL 等锁时间。
+
+        解决大表（如 bi_bill/py_pay）ALTER TABLE 走"查询插入"重建路径导致的
+        慢和 -6407 锁超时。ALTER_TABLE_OPT=3 允许新列（含带默认值）标记为
+        附加列，加列秒级完成；DDL_WAIT_TIME 提高 DDL 等锁上限（默认 10 秒）。
+
+        仅影响当前连接，连接断开自动失效，不修改数据库全局参数；
+        设置失败仅记 warning 并降级为默认行为，不中断同步流程。
+
+        Args:
+            alter_table_opt: ALTER_TABLE_OPT 取值，3 = 附加列快速加列
+            ddl_wait_time: DDL 等锁秒数，达梦上限 60，超出会被收敛
+
+        Returns:
+            成功应用的参数描述列表，如 ['ALTER_TABLE_OPT=3', 'DDL_WAIT_TIME=60']
+        """
+        applied = []
+        settings = (
+            ('ALTER_TABLE_OPT', int(alter_table_opt)),
+            ('DDL_WAIT_TIME', max(0, min(int(ddl_wait_time), 60))),
+        )
+        for name, value in settings:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(f"ALTER SESSION SET '{name}' = {value};")
+                applied.append(f'{name}={value}')
+            except Exception as e:
+                logger.warning("[DDL优化] 会话参数 %s=%s 设置失败（降级为默认行为）: %s",
+                               name, value, e)
+            finally:
+                cursor.close()
+        if applied:
+            logger.info("[DDL优化] 已启用会话级 %s（仅本会话，连接断开自动失效）",
+                        ', '.join(applied))
+        return applied
+
 
 class DMMetadataExtractor:
     """达梦数据库元数据提取器"""
@@ -2085,7 +2123,21 @@ class ReportGenerator:
         if diff.diff_type == '目标端缺失':
             if not diff.test_table:
                 return None
-            return self._generate_create_table_sql(diff.test_table, diff.schema)
+            table_sql = self._generate_create_table_sql(diff.test_table, diff.schema)
+            # 达梦序列无表关联元数据（列默认值/触发器均无引用），本库约定为 表名_SEQ。
+            # 从序列差异中带出：目标端已有该序列时不在 sequence_diffs 里，自然不会重复建。
+            wanted_seq = f'{diff.table}_SEQ'.upper()
+            seq_diff = next(
+                (d for d in self.result.sequence_diffs
+                 if d.schema == diff.schema and d.diff_type == '目标端缺失'
+                 and d.sequence.upper() == wanted_seq),
+                None
+            )
+            if seq_diff:
+                seq_sql = self._generate_sequence_sync_sql(seq_diff)
+                if seq_sql:
+                    return f'{seq_sql}\n{table_sql}'
+            return table_sql
 
         if diff.diff_type == '源端缺失':
             return f"DROP TABLE {self._qualified_name(diff.schema, diff.table)};"
@@ -2138,6 +2190,10 @@ class ReportGenerator:
             index_sql = self._generate_create_index_sql(index, target_schema=target_schema)
             if index_sql:
                 statements.append(index_sql)
+
+        # 外键放最后：可能引用其他尚未同步的表，失败时先建被引用表再重试
+        for fk in table.foreign_keys.values():
+            statements.append(self._generate_fk_create_sql(fk, target_schema))
 
         return "\n".join(statements)
 

@@ -19,8 +19,9 @@ from dm_compare import (
     IndexColumnInfo,
     ForeignKeyInfo,
     ForeignKeyColumn,
+    DMConnection,
 )
-from streamlit_app import split_sql_statements
+from streamlit_app import split_sql_statements, load_ddl_tuning_config, is_lock_timeout_error
 
 
 def test_normalize_dm_data_type():
@@ -216,6 +217,123 @@ def test_deployment_script_ordering():
     assert 'CREATE TABLE' in script
 
 
+def test_missing_table_sql_includes_fk():
+    """目标端缺失的表：同步SQL应一次带全（序列+建表+注释+索引+外键）。"""
+    from dm_compare import (
+        ComparisonResult, TableDiff, TableInfo, ColumnInfo,
+        ForeignKeyInfo, ForeignKeyColumn, ReportGenerator,
+        SequenceDiff, SequenceInfo,
+    )
+    new_table = TableInfo(name='NEW_T', schema='S', table_type='TABLE')
+    new_table.columns = {
+        'id': ColumnInfo('id', 'INT', None, None, None, 'N', None),
+    }
+    fk = ForeignKeyInfo(name='fk_new', schema='S', table_name='NEW_T',
+                        ref_schema='S', ref_table_name='REF_T', delete_rule='CASCADE')
+    fk.columns = [ForeignKeyColumn(column_name='ref_id', position=1, ref_column_name='id')]
+    new_table.foreign_keys = {'fk_new': fk}
+
+    result = ComparisonResult()
+    result.sequence_diffs = [
+        SequenceDiff(schema='S', sequence='NEW_T_SEQ', diff_type='目标端缺失',
+                     test_value='START_WITH=1', prod_value='-',
+                     test_sequence=SequenceInfo(name='NEW_T_SEQ', schema='S', min_value=1,
+                                                max_value=99999999, increment_by=1,
+                                                cycle_flag='N', order_flag='N', cache_size=20)),
+    ]
+    diff = TableDiff(schema='S', table='NEW_T', diff_type='目标端缺失', test_table=new_table)
+    sql = ReportGenerator(result)._generate_table_sync_sql(diff)
+    # 序列在前，建表在后
+    assert sql.index('CREATE SEQUENCE') < sql.index('CREATE TABLE')
+    assert 'FOREIGN KEY ("ref_id")' in sql
+    assert 'REFERENCES S.REF_T ("id")' in sql
+    assert 'ON DELETE CASCADE' in sql
+
+
+class _FakeCursor:
+    """记录 execute 的 SQL，可配置为抛异常，模拟 dmPython 游标。"""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def execute(self, sql):
+        if self.conn.fail:
+            raise RuntimeError('unsupported session parameter')
+        self.conn.executed.append(sql)
+
+    def close(self):
+        pass
+
+
+class _FakeDmConn:
+    def __init__(self, fail=False):
+        self.executed = []
+        self.fail = fail
+
+    def cursor(self):
+        return _FakeCursor(self)
+
+
+def _make_dm_connection(fail=False):
+    conn = DMConnection('mockhost', 5236, 'user', 'pwd')
+    conn.conn = _FakeDmConn(fail=fail)
+    return conn
+
+
+def test_apply_ddl_session_tuning_success():
+    """会话调优成功：两条 ALTER SESSION SET 按序执行并返回参数描述。"""
+    conn = _make_dm_connection()
+    applied = conn.apply_ddl_session_tuning()
+    assert applied == ['ALTER_TABLE_OPT=3', 'DDL_WAIT_TIME=60']
+    assert conn.conn.executed == [
+        "ALTER SESSION SET 'ALTER_TABLE_OPT' = 3;",
+        "ALTER SESSION SET 'DDL_WAIT_TIME' = 60;",
+    ]
+
+
+def test_apply_ddl_session_tuning_clamps_wait_time():
+    """DDL_WAIT_TIME 超过达梦上限 60 秒时收敛到 60。"""
+    conn = _make_dm_connection()
+    applied = conn.apply_ddl_session_tuning(ddl_wait_time=120)
+    assert applied == ['ALTER_TABLE_OPT=3', 'DDL_WAIT_TIME=60']
+    assert "ALTER SESSION SET 'DDL_WAIT_TIME' = 60;" in conn.conn.executed
+
+
+def test_apply_ddl_session_tuning_failure_degrades():
+    """设置失败时降级：不抛异常、返回空列表，同步流程可继续。"""
+    conn = _make_dm_connection(fail=True)
+    applied = conn.apply_ddl_session_tuning()
+    assert applied == []
+
+
+def test_load_ddl_tuning_config():
+    """[ddl_tuning] 缺段回退默认；有段取覆盖值；非法值回退默认。"""
+    import configparser
+
+    # 缺段 → 内置默认
+    config = configparser.ConfigParser(interpolation=None)
+    config.read_string('[options]\noutput_dir = ./reports\n')
+    assert load_ddl_tuning_config(config) == {'enabled': True, 'alter_table_opt': 3, 'ddl_wait_time': 60}
+
+    # 显式关闭
+    config.read_string('[ddl_tuning]\nenabled = false\nalter_table_opt = 2\nddl_wait_time = 30\n')
+    assert load_ddl_tuning_config(config) == {'enabled': False, 'alter_table_opt': 2, 'ddl_wait_time': 30}
+
+    # 非法值 → 逐项回退默认
+    config.read_string('[ddl_tuning]\nenabled = maybe\nalter_table_opt = fast\nddl_wait_time = \n')
+    assert load_ddl_tuning_config(config) == {'enabled': True, 'alter_table_opt': 3, 'ddl_wait_time': 60}
+
+
+def test_is_lock_timeout_error():
+    """识别达梦 -6407 锁超时的各种报错文本形态。"""
+    assert is_lock_timeout_error(Exception('[-6407]: Lock request timeout'))
+    assert is_lock_timeout_error(Exception('code: -6407 锁超时'))
+    assert is_lock_timeout_error(RuntimeError('锁请求超时: 锁超时'))
+    assert is_lock_timeout_error(Exception('Lock request timeout occurred'))
+    assert not is_lock_timeout_error(Exception('[-6406]: other error'))
+    assert not is_lock_timeout_error(Exception('network unreachable'))
+
+
 def run_all():
     tests = [
         test_normalize_dm_data_type,
@@ -230,6 +348,12 @@ def run_all():
         test_quote_identifier,
         test_is_name_excluded,
         test_deployment_script_ordering,
+        test_missing_table_sql_includes_fk,
+        test_apply_ddl_session_tuning_success,
+        test_apply_ddl_session_tuning_clamps_wait_time,
+        test_apply_ddl_session_tuning_failure_degrades,
+        test_load_ddl_tuning_config,
+        test_is_lock_timeout_error,
     ]
     passed = 0
     failed = 0
