@@ -197,6 +197,6 @@ A: 检查以下项目：
 ### Q: 查询某些表时报错
 A: 可能是权限不足，请确保数据库用户有DBA权限
 
-## 技术支持
+## 问题反馈
 
-如有问题请联系技术支持团队。
+使用中遇到问题或有好想法，欢迎提 [Issue](https://github.com/Mzaxd/dm-schema-compare/issues)。
