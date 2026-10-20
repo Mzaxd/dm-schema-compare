@@ -8,7 +8,7 @@ import json
 import logging
 import os
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -27,7 +27,9 @@ from dm_compare import (
     build_summary_rows,
     build_table_diff_rows,
     build_view_diff_rows,
+    count_reverse_length_diffs,
     generate_deployment_script,
+    generate_reverse_sync_script,
     load_config,
     load_prod_schema_configs,
     load_schema_configs,
@@ -302,6 +304,37 @@ def get_target_config_map(config: configparser.ConfigParser):
     return {item.schema: item for item in items}
 
 
+def get_source_config_map(config: configparser.ConfigParser):
+    """按源端模式名索引连接配置；仅 dual 模式（source_env_*）有按模式的源端配置。"""
+    if _detect_config_mode(config) == 'dual':
+        items = load_schema_configs(config, 'source_env_')
+        return {item.schema: item for item in items}
+    return {}
+
+
+def get_legacy_source_config(config: configparser.ConfigParser):
+    """legacy 模式源端 [test_env] 单连接配置（整实例任意模式）；dual 模式返回 None。"""
+    if _detect_config_mode(config) == 'dual' or not config.has_section('test_env'):
+        return None
+    try:
+        return SchemaConnectionConfig(
+            schema='',
+            user=config.get('test_env', 'user'),
+            password=config.get('test_env', 'password'),
+            host=config.get('test_env', 'host'),
+            port=config.getint('test_env', 'port'),
+        )
+    except (configparser.Error, ValueError) as exc:
+        logger.warning("[执行] [test_env] 源端配置读取失败: %s", exc)
+        return None
+
+
+def get_inverse_schema_mapping(config: configparser.ConfigParser) -> Dict[str, str]:
+    """目标端模式名 → 源端模式名 的反查映射（模式映射正向为 源端:目标端）。"""
+    mapping = parse_schema_mapping(config.get('options', 'schema_mapping', fallback=''))
+    return {target: source for source, target in mapping.items()}
+
+
 DEFAULT_DDL_TUNING = {'enabled': True, 'alter_table_opt': 3, 'ddl_wait_time': 60}
 
 # -6407 锁超时的可操作提示：引导定位阻塞 DDL 的未提交事务
@@ -341,11 +374,15 @@ def execute_selected_sql(selected_df: pd.DataFrame,
                          allow_repeat: bool = False,
                          progress_callback=None,
                          config_path: str = None) -> List[Dict[str, str]]:
-    """按模式路由到目标端数据库执行选中SQL。"""
+    """按「执行端」路由执行选中SQL：默认目标端；标注源端的反向同步SQL路由到源端连接。"""
     config = load_config(config_path or os.path.join(SCRIPT_DIR, 'config.ini'))
-    prod_config_map = get_target_config_map(config)
+    target_config_map = get_target_config_map(config)
+    source_config_map = get_source_config_map(config)
+    legacy_source_config = get_legacy_source_config(config)
+    inverse_schema_mapping = get_inverse_schema_mapping(config)
     ddl_tuning = load_ddl_tuning_config(config)
-    connections: Dict[str, DMConnection] = {}
+    # 连接缓存键：(端, host, port, user)，同端同实例同用户复用一个连接
+    connections: Dict[Tuple[str, str, int, str], DMConnection] = {}
     results = []
     execution_state = load_execution_state()
     total = len(selected_df)
@@ -368,17 +405,32 @@ def execute_selected_sql(selected_df: pd.DataFrame,
                 })
                 continue
 
-            if schema not in prod_config_map:
-                results.append({
-                    '模式名': schema,
-                    '对象': build_row_label(row),
-                    '执行结果': f'失败: 未找到目标端模式 {schema} 的连接配置',
-                    'SQL': sql_text
-                })
-                continue
+            side = str(row.get('执行端', '')).strip() or '目标端'
+            if side == '源端':
+                # 反向同步：模式名从映射后的（目标端）名字还原为源端实际模式名
+                source_schema = inverse_schema_mapping.get(schema, schema)
+                schema_config = source_config_map.get(source_schema) or legacy_source_config
+                if schema_config is None:
+                    results.append({
+                        '模式名': schema,
+                        '对象': build_row_label(row),
+                        '执行结果': f'失败: 未找到源端模式 {source_schema} 的连接配置（dual 模式需 source_env_* 配置段）',
+                        'SQL': sql_text
+                    })
+                    continue
+            else:
+                schema_config = target_config_map.get(schema)
+                if schema_config is None:
+                    results.append({
+                        '模式名': schema,
+                        '对象': build_row_label(row),
+                        '执行结果': f'失败: 未找到目标端模式 {schema} 的连接配置',
+                        'SQL': sql_text
+                    })
+                    continue
 
-            if schema not in connections:
-                schema_config = prod_config_map[schema]
+            conn_key = (side, schema_config.host, schema_config.port, schema_config.user)
+            if conn_key not in connections:
                 connection = DMConnection(
                     schema_config.host,
                     schema_config.port,
@@ -389,7 +441,7 @@ def execute_selected_sql(selected_df: pd.DataFrame,
                     results.append({
                         '模式名': schema,
                         '对象': build_row_label(row),
-                        '执行结果': f'失败: 目标端模式 {schema} 连接失败',
+                        '执行结果': f'失败: {side}模式 {schema} 连接失败',
                         'SQL': sql_text
                     })
                     continue
@@ -399,14 +451,15 @@ def execute_selected_sql(selected_df: pd.DataFrame,
                         ddl_tuning['ddl_wait_time']
                     )
                     if applied:
-                        logger.info("[审计] DDL会话优化 | 模式=%s | %s（仅本会话，断开自动失效）",
-                                    schema, ', '.join(applied))
-                connections[schema] = connection
+                        logger.info("[审计] DDL会话优化 | 端=%s | 模式=%s | %s（仅本会话，断开自动失效）",
+                                    side, schema, ', '.join(applied))
+                connections[conn_key] = connection
 
+            connection = connections[conn_key]
             statements = split_sql_statements(sql_text)
             all_succeeded = True
             for statement in statements:
-                cursor = connections[schema].conn.cursor()
+                cursor = connection.conn.cursor()
                 try:
                     cursor.execute(statement)
                     results.append({
@@ -416,10 +469,10 @@ def execute_selected_sql(selected_df: pd.DataFrame,
                         'SQL': statement
                     })
                     log_sql = ' '.join(statement.split())[:200]
-                    logger.info("[审计] SQL执行成功 | 模式=%s | SQL=%s", schema, log_sql)
+                    logger.info("[审计] SQL执行成功 | 端=%s | 模式=%s | SQL=%s", side, schema, log_sql)
                 except Exception as exc:
-                    if hasattr(connections[schema].conn, 'rollback'):
-                        connections[schema].conn.rollback()
+                    if hasattr(connection.conn, 'rollback'):
+                        connection.conn.rollback()
                     fail_message = f'失败: {exc}'
                     if is_lock_timeout_error(exc):
                         fail_message += LOCK_TIMEOUT_HINT
@@ -430,15 +483,16 @@ def execute_selected_sql(selected_df: pd.DataFrame,
                         'SQL': statement
                     })
                     log_sql = ' '.join(statement.split())[:200]
-                    logger.error("[审计] SQL执行失败 | 模式=%s | 错误=%s | SQL=%s", schema, exc, log_sql)
+                    logger.error("[审计] SQL执行失败 | 端=%s | 模式=%s | 错误=%s | SQL=%s",
+                                 side, schema, exc, log_sql)
                     all_succeeded = False
                     break
                 finally:
                     cursor.close()
 
             if all_succeeded:
-                if hasattr(connections[schema].conn, 'commit'):
-                    connections[schema].conn.commit()
+                if hasattr(connection.conn, 'commit'):
+                    connection.conn.commit()
                 mark_sql_success(execution_state, row, sql_column)
 
         save_execution_state(execution_state)
@@ -470,7 +524,7 @@ def render_dataframe(title: str, rows: List[Dict[str, object]], sql_column: str 
             if hide_executed:
                 df = df[df['执行状态'] != '已成功']
 
-        filter_columns = [column for column in ('差异类型', '所在环境', '模式名', '同步建议', '执行状态') if column in df.columns]
+        filter_columns = [column for column in ('差异类型', '所在环境', '模式名', '执行端', '同步建议', '执行状态') if column in df.columns]
         if filter_columns:
             filter_cols = st.columns(len(filter_columns))
             for index, column in enumerate(filter_columns):
@@ -544,7 +598,11 @@ def render_dataframe(title: str, rows: List[Dict[str, object]], sql_column: str 
         st.code(combined_sql, language='sql')
 
         st.divider()
-        st.warning('执行会直接连接目标端数据库。请先确认 SQL 内容、目标模式和对象。')
+        # 执行端可能包含源端（反向同步）或目标端，确认文案随所选行动态提示
+        side_values = [v for v in sorted(set(selected_df['执行端'].astype(str))) if v.strip()] \
+            if '执行端' in selected_df.columns else []
+        side_label = '、'.join(side_values) or '目标端'
+        st.warning(f'执行会直接连接{side_label}数据库。请先确认 SQL 内容、模式和对象。')
         allow_repeat = st.checkbox(
             '允许重复执行已成功 SQL',
             key=f'allow_repeat_execute_{title}',
@@ -563,7 +621,7 @@ def render_dataframe(title: str, rows: List[Dict[str, object]], sql_column: str 
         if st.session_state.get(pending_key):
             confirm_key = f'confirm_execute_{title}_{st.session_state[nonce_key]}'
             st.checkbox(
-                '我确认要在目标端执行当前选中的 SQL',
+                f'我确认要在{side_label}执行当前选中的 SQL',
                 key=confirm_key
             )
             if st.button(
@@ -687,6 +745,17 @@ def render_result(config_path: str):
             help=f'按依赖关系排序：建表→加字段→改字段→主键→索引→序列→外键→注释。共 {diff_total} 条差异。',
             disabled=(diff_total == 0),
         )
+
+        reverse_count = count_reverse_length_diffs(result)
+        if reverse_count:
+            st.download_button(
+                '⬇ 下载反向同步脚本（在源端执行）',
+                generate_reverse_sync_script(result).encode('utf-8'),
+                file_name=f'reverse_{datetime.now().strftime("%Y%m%d_%H%M%S")}.sql',
+                mime='text/plain',
+                help=(f'{reverse_count} 条长度差异为目标端更长（生产临时扩长），'
+                      f'这些 SQL 需在源端执行，把源端字段扩到目标端长度。'),
+            )
 
     tabs = st.tabs(['汇总概览', '表差异', '字段差异', '索引差异', '主键差异', '序列差异',
                      '外键差异', '视图差异', '过程函数触发器差异'])

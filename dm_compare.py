@@ -2313,6 +2313,60 @@ class ReportGenerator:
 
         return sql
 
+    # ---------- 字段反向同步（目标端更长，改源端） ----------
+
+    @staticmethod
+    def _is_reverse_length_diff(diff: ColumnDiff) -> bool:
+        """长度变更且目标端更长：生产临时扩长场景，应反向同步（改源端），避免缩短目标端。
+
+        仅限两端类型一致（归一化后）的长度类型字段；类型也不同时属真正的类型
+        差异，仍按正向（源端为准）处理。
+        """
+        if diff.diff_type != '长度变更' or not diff.test_column or not diff.prod_column:
+            return False
+        test_type = _normalize_dm_data_type(diff.test_column.data_type)
+        prod_type = _normalize_dm_data_type(diff.prod_column.data_type)
+        if test_type != prod_type or prod_type not in LENGTH_DATA_TYPES:
+            return False
+        return bool(diff.test_column.length and diff.prod_column.length
+                    and diff.prod_column.length > diff.test_column.length)
+
+    def _get_column_execution_side(self, diff: ColumnDiff) -> str:
+        """字段同步 SQL 的执行端：反向长度差异在源端执行，其余在目标端执行。"""
+        return '源端' if self._is_reverse_length_diff(diff) else '目标端'
+
+    def _get_column_sync_advice(self, diff: ColumnDiff) -> str:
+        """字段差异同步建议。"""
+        if self._is_reverse_length_diff(diff):
+            return (f"目标端长度更长（{diff.test_value}→{diff.prod_value}，疑似生产临时扩长），"
+                    "反向同步：在源端执行，把源端扩到目标端长度")
+        return ''
+
+    def _get_reverse_schema(self, schema: str) -> str:
+        """把对比用的（映射后）模式名还原为源端实际模式名。"""
+        for source_schema, mapped_schema in (self.result.schema_mappings or {}).items():
+            if mapped_schema == schema:
+                return source_schema
+        return schema
+
+    def _generate_column_reverse_sql(self, diff: ColumnDiff) -> Optional[str]:
+        """反向同步 SQL：按目标端（更长）定义扩长源端，schema 用源端实际模式名。"""
+        if not diff.prod_column:
+            return None
+        table_name = self._qualified_name(self._get_reverse_schema(diff.schema), diff.table)
+        column_name = self._quote_identifier(diff.column)
+        return f"ALTER TABLE {table_name} MODIFY {column_name} {self._get_column_type_sql(diff.prod_column)};"
+
+    def _generate_column_sync_sql(self, diff: ColumnDiff) -> Optional[str]:
+        """字段差异同步 SQL 入口：长度反向场景生成改源端的 SQL，其余按源端同步目标端。"""
+        if self._is_reverse_length_diff(diff):
+            return self._generate_column_reverse_sql(diff)
+        return self._generate_sync_sql(
+            diff.schema, diff.table, diff.column,
+            diff.diff_type, diff.test_value, diff.prod_value,
+            diff.test_column,
+        )
+
     @staticmethod
     def _quote_identifier(identifier: str) -> str:
         """必要时为达梦标识符加双引号。"""
@@ -2449,7 +2503,8 @@ class ReportGenerator:
 
         # 标题
         headers = ['模式名', '表名', '字段名', '差异类型',
-                    f'{self.result.source_label}值', f'{self.result.target_label}值', '同步SQL']
+                   f'{self.result.source_label}值', f'{self.result.target_label}值',
+                   '执行端', '同步建议', '同步SQL']
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=1, column=col, value=header)
             cell.font = style['title_font']
@@ -2471,13 +2526,13 @@ class ReportGenerator:
                 cell.fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
             ws.cell(row=row, column=5, value=diff.test_value).border = style['thin_border']
             ws.cell(row=row, column=6, value=diff.prod_value).border = style['thin_border']
+            ws.cell(row=row, column=7, value=self._get_column_execution_side(diff)).border = style['thin_border']
+            ws.cell(row=row, column=8, value=self._get_column_sync_advice(diff)).border = style['thin_border']
 
-            # 生成并写入SQL
-            sql = self._generate_sync_sql(diff.schema, diff.table, diff.column,
-                                          diff.diff_type, diff.test_value, diff.prod_value,
-                                          diff.test_column)
+            # 生成并写入SQL（长度反向差异生成改源端的SQL，执行端列标注在哪端执行）
+            sql = self._generate_column_sync_sql(diff)
             if sql:
-                sql_cell = ws.cell(row=row, column=7, value=sql)
+                sql_cell = ws.cell(row=row, column=9, value=sql)
                 sql_cell.border = style['thin_border']
                 sql_cell.alignment = Alignment(wrap_text=True, vertical='top')
 
@@ -2488,7 +2543,9 @@ class ReportGenerator:
         ws.column_dimensions['D'].width = 15
         ws.column_dimensions['E'].width = 30
         ws.column_dimensions['F'].width = 30
-        ws.column_dimensions['G'].width = 120
+        ws.column_dimensions['G'].width = 10
+        ws.column_dimensions['H'].width = 50
+        ws.column_dimensions['I'].width = 120
         self._apply_table_features(ws)
 
     def _create_index_diff_sheet(self, wb: Workbook, style: dict):
@@ -3298,9 +3355,9 @@ def build_column_diff_rows(result: ComparisonResult) -> List[Dict[str, Any]]:
             '差异类型': diff.diff_type,
             f'{sl}值': diff.test_value,
             f'{tl}值': diff.prod_value,
-            '同步SQL': generator._generate_sync_sql(diff.schema, diff.table, diff.column,
-                                                   diff.diff_type, diff.test_value, diff.prod_value,
-                                                   diff.test_column) or ''
+            '执行端': generator._get_column_execution_side(diff),
+            '同步建议': generator._get_column_sync_advice(diff),
+            '同步SQL': generator._generate_column_sync_sql(diff) or ''
         }
         for diff in result.column_diffs
     ]
@@ -3437,6 +3494,9 @@ def generate_deployment_script(result: ComparisonResult) -> str:
 
     # Phase 2-3: 字段差异（ADD 先于 MODIFY）
     for diff in result.column_diffs:
+        if generator._is_reverse_length_diff(diff):
+            # 目标端更长的长度差异需在源端执行，不进目标端部署脚本
+            continue
         sql = generator._generate_sync_sql(
             diff.schema, diff.table, diff.column,
             diff.diff_type, diff.test_value, diff.prod_value,
@@ -3499,6 +3559,12 @@ def generate_deployment_script(result: ComparisonResult) -> str:
         '',
     ]
 
+    reverse_count = count_reverse_length_diffs(result)
+    if reverse_count:
+        lines.append(f'-- 注意: 另有 {reverse_count} 条长度差异为目标端更长（生产临时扩长），')
+        lines.append('--       不在本脚本内，需在【源端】执行（见反向同步脚本）。')
+        lines.append('')
+
     current_phase = 0
     for phase, _schema, _table, _key, sql in items:
         if phase != current_phase:
@@ -3513,6 +3579,41 @@ def generate_deployment_script(result: ComparisonResult) -> str:
     if not items:
         lines.append('-- 无差异，空脚本')
 
+    return '\n'.join(lines)
+
+
+def count_reverse_length_diffs(result: ComparisonResult) -> int:
+    """统计需要反向同步（目标端更长）的字段差异数量。"""
+    generator = ReportGenerator(result)
+    return sum(1 for diff in result.column_diffs if generator._is_reverse_length_diff(diff))
+
+
+def generate_reverse_sync_script(result: ComparisonResult) -> str:
+    """生成反向同步脚本：目标端长度更长（生产临时扩长）的字段，在源端执行扩长。"""
+    generator = ReportGenerator(result)
+    items: List[Tuple[str, str, str, str]] = []
+    for diff in result.column_diffs:
+        if not generator._is_reverse_length_diff(diff):
+            continue
+        sql = generator._generate_column_reverse_sql(diff)
+        if sql:
+            items.append((diff.schema, diff.table, diff.column, sql))
+    items.sort(key=lambda x: (x[0], x[1], x[2]))
+
+    lines = [
+        '-- ============================================',
+        '-- 达梦数据库结构反向同步脚本（在源端执行）',
+        f'-- 场景: {result.target_label}字段被临时扩长，回传扩长{result.source_label}',
+        f'-- 源端: {result.source_label}',
+        f'-- 生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
+        '-- ============================================',
+        '',
+    ]
+    if not items:
+        lines.append('-- 无反向同步差异，空脚本')
+    for _schema, _table, _column, sql in items:
+        lines.append(sql)
+        lines.append('')
     return '\n'.join(lines)
 
 

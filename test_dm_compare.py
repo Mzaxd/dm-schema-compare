@@ -250,6 +250,103 @@ def test_missing_table_sql_includes_fk():
     assert 'ON DELETE CASCADE' in sql
 
 
+def _make_length_diff(test_len, prod_len, schema='S',
+                      test_type='VARCHAR', prod_type='VARCHAR'):
+    """构造一条长度变更的 ColumnDiff 及其 ComparisonResult。"""
+    from dm_compare import ComparisonResult, ColumnDiff, ColumnInfo
+    result = ComparisonResult()
+    diff = ColumnDiff(
+        schema=schema, table='T', column='C', diff_type='长度变更',
+        test_value=str(test_len), prod_value=str(prod_len),
+        test_column=ColumnInfo('C', test_type, test_len, None, None, 'Y', None),
+        prod_column=ColumnInfo('C', prod_type, prod_len, None, None, 'Y', None),
+    )
+    return result, diff
+
+
+def test_reverse_length_diff_targets_source():
+    """目标端更长（生产临时扩长）：SQL 改为在源端执行、按目标端长度扩源端。"""
+    from dm_compare import ReportGenerator
+    result, diff = _make_length_diff(100, 200)
+    generator = ReportGenerator(result)
+    assert generator._is_reverse_length_diff(diff)
+    assert generator._get_column_execution_side(diff) == '源端'
+    assert generator._generate_column_sync_sql(diff) == 'ALTER TABLE S.T MODIFY C VARCHAR(200);'
+    assert '反向同步' in generator._get_column_sync_advice(diff)
+
+
+def test_forward_length_diff_still_targets_prod():
+    """源端更长：维持正向，在目标端执行、把目标端扩到源端长度。"""
+    from dm_compare import ReportGenerator
+    result, diff = _make_length_diff(200, 100)
+    generator = ReportGenerator(result)
+    assert not generator._is_reverse_length_diff(diff)
+    assert generator._get_column_execution_side(diff) == '目标端'
+    assert generator._generate_column_sync_sql(diff) == 'ALTER TABLE S.T MODIFY C VARCHAR(200);'
+    assert generator._get_column_sync_advice(diff) == ''
+
+
+def test_reverse_length_diff_type_mismatch_keeps_forward():
+    """类型也不一致时不视为临时扩长，维持正向（源端为准）。"""
+    from dm_compare import ReportGenerator
+    result, diff = _make_length_diff(100, 200, test_type='VARCHAR', prod_type='CHAR')
+    generator = ReportGenerator(result)
+    assert not generator._is_reverse_length_diff(diff)
+    assert generator._get_column_execution_side(diff) == '目标端'
+
+
+def test_reverse_length_diff_restores_source_schema_name():
+    """模式映射 GASBASE→BASE：反向 SQL 的模式名需还原为源端实际名 GASBASE。"""
+    from dm_compare import ReportGenerator
+    result, diff = _make_length_diff(100, 200, schema='BASE')
+    result.schema_mappings = {'GASBASE': 'BASE'}
+    generator = ReportGenerator(result)
+    sql = generator._generate_column_reverse_sql(diff)
+    assert 'GASBASE.T' in sql
+    assert 'ALTER TABLE GASBASE.T MODIFY C VARCHAR(200);' == sql
+
+
+def test_build_column_diff_rows_marks_execution_side():
+    from dm_compare import build_column_diff_rows
+    result, diff = _make_length_diff(100, 200)
+    result.column_diffs = [diff]
+    rows = build_column_diff_rows(result)
+    assert rows[0]['执行端'] == '源端'
+    assert rows[0]['同步SQL'] == 'ALTER TABLE S.T MODIFY C VARCHAR(200);'
+
+    result2, diff2 = _make_length_diff(200, 100)
+    result2.column_diffs = [diff2]
+    rows2 = build_column_diff_rows(result2)
+    assert rows2[0]['执行端'] == '目标端'
+
+
+def test_deployment_script_excludes_reverse_diff():
+    """目标端部署脚本必须剔除反向项；反向脚本包含它。"""
+    from dm_compare import generate_deployment_script, generate_reverse_sync_script
+    result, diff = _make_length_diff(100, 200)
+    result.column_diffs = [diff]
+
+    script = generate_deployment_script(result)
+    assert 'MODIFY' not in script
+    assert '源端' in script  # 头部有提示
+
+    reverse = generate_reverse_sync_script(result)
+    assert 'ALTER TABLE S.T MODIFY C VARCHAR(200);' in reverse
+    assert '在源端执行' in reverse
+
+
+def test_get_inverse_schema_mapping():
+    """目标端模式名反查源端模式名，用于反向 SQL 的连接路由。"""
+    import configparser
+    from streamlit_app import get_inverse_schema_mapping
+    config = configparser.ConfigParser(interpolation=None)
+    config.read_string('[options]\nschema_mapping = GASBASE:BASE, HALL:HALL\n')
+    assert get_inverse_schema_mapping(config) == {'BASE': 'GASBASE', 'HALL': 'HALL'}
+    empty_config = configparser.ConfigParser(interpolation=None)
+    empty_config.read_string('[options]\n')
+    assert get_inverse_schema_mapping(empty_config) == {}
+
+
 class _FakeCursor:
     """记录 execute 的 SQL，可配置为抛异常，模拟 dmPython 游标。"""
 
@@ -349,6 +446,13 @@ def run_all():
         test_is_name_excluded,
         test_deployment_script_ordering,
         test_missing_table_sql_includes_fk,
+        test_reverse_length_diff_targets_source,
+        test_forward_length_diff_still_targets_prod,
+        test_reverse_length_diff_type_mismatch_keeps_forward,
+        test_reverse_length_diff_restores_source_schema_name,
+        test_build_column_diff_rows_marks_execution_side,
+        test_deployment_script_excludes_reverse_diff,
+        test_get_inverse_schema_mapping,
         test_apply_ddl_session_tuning_success,
         test_apply_ddl_session_tuning_clamps_wait_time,
         test_apply_ddl_session_tuning_failure_degrades,
