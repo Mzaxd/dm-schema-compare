@@ -1,12 +1,15 @@
 # dm_compare
 
+# 真实连接配置不入库，只提交示例配置
 *.ini
+!config.example.ini
 reports/
 logs/
 __pycache__/
 *.pyc
 .DS_Store
 .streamlit/secrets.toml
+.claude/
 
-# 运行时对比结果输出（UAT/PROD 差异、菜单同步等临时产物）
+# 运行时对比结果输出等临时产物
 _*.txt

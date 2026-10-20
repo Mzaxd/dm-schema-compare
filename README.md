@@ -41,30 +41,44 @@ pip install -r requirements.txt
 
 ## 配置说明
 
-编辑 `config.ini` 文件，配置数据库连接信息：
+复制 `config.example.ini` 为 `config.ini`，填入真实连接信息（`config.ini` 已被 gitignore，不会入库）：
+
+```bash
+cp config.example.ini config.ini
+```
+
+支持两种配置模式，程序按配置段自动识别：
+
+- **legacy**：`[test_env]` 单连接源端（提取该实例所有模式）+ `[prod_env_*]` 多连接目标端，每个模式一个配置段：
 
 ```ini
 [test_env]
-# 测试环境数据库连接信息
 host = 192.168.1.100
 port = 5236
 user = SYSDBA
 password = your_password
 
-[prod_env]
-# 生产环境数据库连接信息
+[prod_env_base]
 host = 192.168.1.200
 port = 5236
-user = SYSDBA
+schema = APP
+user = APP
 password = your_password
 
 [options]
 # 排除的系统模式（逗号分隔）
 exclude_schemas = SYS,SYSDBA,CTISYS,SYSJOB,SYSAUDITOR
 
+# 模式名映射：源端模式:目标端模式，两端模式不同名时使用
+# schema_mapping = SRC_APP:APP
+
 # 输出目录（相对于脚本路径或绝对路径）
 output_dir = ./reports
 ```
+
+- **dual**：`[source_env_*]` 多连接源端 + `[target_env_*]` 多连接目标端，两端都是每个模式一个配置段，适合多库多实例场景。完整示例见 `config.example.ini`。
+
+另有 `[ddl_tuning]` 段可控制执行 DDL 时的会话级优化（快速加列、延长等锁时间），默认开启。
 
 ## 使用方法
 
@@ -157,7 +171,7 @@ python dm_compare.py
   - 生成的 SQL 为 `ALTER TABLE <源端模式>.<表> MODIFY <字段> <目标端类型长度>;`，即把源端扩到目标端长度
   - 页面/Excel 的字段差异表新增「执行端」列（源端/目标端）和「同步建议」说明
   - 页面上执行选中 SQL 时按「执行端」自动路由：`源端` 行连源端库执行（dual 模式按 `source_env_*` 路由，legacy 模式用 `[test_env]` 单连接），`目标端` 行维持原行为
-  - 模式名带映射时（如 `GASBASE:BASE`），反向 SQL 自动还原为源端实际模式名
+  - 模式名带映射时（如 `SOURCE_SCHEMA:TARGET_SCHEMA`），反向 SQL 自动还原为源端实际模式名
 - 源端更长的正常长度差异不受影响，仍按源端同步目标端
 - 完整部署脚本（目标端执行）**不包含**反向项，头部会注明条数；侧边栏另提供「⬇ 下载反向同步脚本（在源端执行）」
 

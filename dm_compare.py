@@ -415,7 +415,7 @@ class DMConnection:
                                  ddl_wait_time: int = 60) -> List[str]:
         """会话级启用 DDL 优化：快速加列 + 延长 DDL 等锁时间。
 
-        解决大表（如 bi_bill/py_pay）ALTER TABLE 走"查询插入"重建路径导致的
+        解决大表 ALTER TABLE 走"查询插入"重建路径导致的
         慢和 -6407 锁超时。ALTER_TABLE_OPT=3 允许新列（含带默认值）标记为
         附加列，加列秒级完成；DDL_WAIT_TIME 提高 DDL 等锁上限（默认 10 秒）。
 

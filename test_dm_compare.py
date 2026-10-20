@@ -296,14 +296,14 @@ def test_reverse_length_diff_type_mismatch_keeps_forward():
 
 
 def test_reverse_length_diff_restores_source_schema_name():
-    """模式映射 GASBASE→BASE：反向 SQL 的模式名需还原为源端实际名 GASBASE。"""
+    """模式映射 SRC_APP→APP：反向 SQL 的模式名需还原为源端实际名 SRC_APP。"""
     from dm_compare import ReportGenerator
-    result, diff = _make_length_diff(100, 200, schema='BASE')
-    result.schema_mappings = {'GASBASE': 'BASE'}
+    result, diff = _make_length_diff(100, 200, schema='APP')
+    result.schema_mappings = {'SRC_APP': 'APP'}
     generator = ReportGenerator(result)
     sql = generator._generate_column_reverse_sql(diff)
-    assert 'GASBASE.T' in sql
-    assert 'ALTER TABLE GASBASE.T MODIFY C VARCHAR(200);' == sql
+    assert 'SRC_APP.T' in sql
+    assert 'ALTER TABLE SRC_APP.T MODIFY C VARCHAR(200);' == sql
 
 
 def test_build_column_diff_rows_marks_execution_side():
@@ -340,8 +340,8 @@ def test_get_inverse_schema_mapping():
     import configparser
     from streamlit_app import get_inverse_schema_mapping
     config = configparser.ConfigParser(interpolation=None)
-    config.read_string('[options]\nschema_mapping = GASBASE:BASE, HALL:HALL\n')
-    assert get_inverse_schema_mapping(config) == {'BASE': 'GASBASE', 'HALL': 'HALL'}
+    config.read_string('[options]\nschema_mapping = SRC_APP:APP, SAME:SAME\n')
+    assert get_inverse_schema_mapping(config) == {'APP': 'SRC_APP', 'SAME': 'SAME'}
     empty_config = configparser.ConfigParser(interpolation=None)
     empty_config.read_string('[options]\n')
     assert get_inverse_schema_mapping(empty_config) == {}
